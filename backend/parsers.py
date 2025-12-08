@@ -33,6 +33,15 @@ class Parser23andMe:
         self.skipped_undetermined: int = 0
         self.total_lines: int = 0
         self.valid_lines: int = 0
+        self.progress_callback = None
+    
+    def set_progress_callback(self, callback) -> None:
+        """
+        Set a callback function for progress updates.
+        
+        The callback should accept (lines_processed, total_lines) parameters.
+        """
+        self.progress_callback = callback
     
     def parse_file(self, filepath: str) -> List[SNPRecord]:
         """
@@ -56,12 +65,23 @@ class Parser23andMe:
         if not validate_file_exists(filepath):
             raise ParseError(f"File not found or not readable: {filepath}")
         
+        # Count total lines first
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                total_lines = sum(1 for _ in f)
+        except IOError as e:
+            raise ParseError(f"Error reading file: {str(e)}")
+        
         records: List[SNPRecord] = []
         
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, start=1):
                     self.total_lines += 1
+                    
+                    # Report progress
+                    if self.progress_callback:
+                        self.progress_callback(self.total_lines, total_lines)
                     
                     success, data, message = validate_23andme_line(line, line_num)
                     

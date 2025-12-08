@@ -22,17 +22,46 @@ Setup:
 
 import sys
 import os
+import traceback
+from datetime import datetime
 
 # Ensure the application directory is in the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 
 from frontend.main_window import MainWindow
-from utils.logging_config import setup_logging, get_logger
+from utils.logging_config import setup_logging, get_logger, log_error, ERROR_LOG_FILE
 from database.setup_database import verify_database, create_database
 from config import DATABASE_PATH
+
+
+def qt_message_handler(mode, context, message):
+    """
+    Custom Qt message handler to log Qt warnings and errors.
+    """
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+    
+    if mode == QtMsgType.QtWarningMsg:
+        level = "QT_WARNING"
+    elif mode == QtMsgType.QtCriticalMsg:
+        level = "QT_CRITICAL"
+    elif mode == QtMsgType.QtFatalMsg:
+        level = "QT_FATAL"
+    else:
+        return  # Don't log debug/info messages
+    
+    log_msg = f"{timestamp} - {level} - {message}"
+    if context.file:
+        log_msg += f" ({context.file}:{context.line})"
+    log_msg += "\n"
+    
+    try:
+        with open(ERROR_LOG_FILE, 'a') as f:
+            f.write(log_msg)
+    except Exception:
+        pass
 
 
 def ensure_database() -> bool:
@@ -56,36 +85,59 @@ def main() -> int:
     Returns:
         int: Exit code (0 for success).
     """
-    # Setup logging
+    # Setup logging (this also sets up global exception handler)
     setup_logging()
     logger = get_logger(__name__)
     
+    # Install Qt message handler
+    qInstallMessageHandler(qt_message_handler)
+    
     logger.info("Starting Genetic Analysis Application")
     
-    # Ensure database exists
-    if not ensure_database():
-        logger.error("Failed to initialize database")
-        print("Error: Could not initialize database. Exiting.")
+    try:
+        # Ensure database exists
+        if not ensure_database():
+            logger.error("Failed to initialize database")
+            log_error("Failed to initialize database")
+            print("Error: Could not initialize database. Exiting.")
+            return 1
+        
+        # Create Qt application
+        app = QApplication(sys.argv)
+        app.setApplicationName("Genetic Analysis")
+        app.setApplicationVersion("1.0.0")
+        
+        # Enable high DPI support
+        app.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+        
+        # Create and show main window
+        window = MainWindow()
+        window.show()
+        
+        logger.info("Application window displayed")
+        
+        # Run event loop
+        return app.exec()
+        
+    except Exception as e:
+        # Log any unhandled exception during startup
+        log_error(f"Fatal error during application startup: {e}", e)
+        logger.critical(f"Fatal error: {e}", exc_info=True)
+        
+        # Try to show error dialog
+        try:
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(
+                None,
+                "Fatal Error",
+                f"A fatal error occurred:\n\n{str(e)}\n\nCheck error.log for details."
+            )
+        except Exception:
+            pass
+        
         return 1
-    
-    # Create Qt application
-    app = QApplication(sys.argv)
-    app.setApplicationName("Genetic Analysis")
-    app.setApplicationVersion("1.0.0")
-    
-    # Enable high DPI support
-    app.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-    
-    # Create and show main window
-    window = MainWindow()
-    window.show()
-    
-    logger.info("Application window displayed")
-    
-    # Run event loop
-    return app.exec()
 
 
 if __name__ == '__main__':

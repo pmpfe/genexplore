@@ -2,6 +2,8 @@
 
 A PyQt6-based desktop application for analyzing 23andMe genetic data against the GWAS Catalog.
 
+![App Screenshot](utils/screenshot.png)
+
 ## Features
 
 ### Level 1 - MVP

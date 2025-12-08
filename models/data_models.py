@@ -127,6 +127,7 @@ class FilterCriteria:
         min_score: Minimum impact score threshold (0-10)
         max_pvalue: Maximum p-value threshold (0-1)
         category: Trait category filter ('ALL' for no filter)
+        carrier_status: Carrier status filter ('ALL', 'non-carrier', 'heterozygous', 'homozygous', 'carrier')
         search_text: Free text search in traits and genes
         sort_by: Sort column ('score', 'pvalue', 'trait')
         sort_ascending: Sort direction
@@ -134,6 +135,7 @@ class FilterCriteria:
     min_score: float = 0.0
     max_pvalue: float = 1.0
     category: str = 'ALL'
+    carrier_status: str = 'ALL'
     search_text: str = ''
     sort_by: str = 'score'
     sort_ascending: bool = False
@@ -171,6 +173,17 @@ class FilterCriteria:
         # Filter by category
         if self.category and self.category != 'ALL':
             filtered = [m for m in filtered if m.category == self.category]
+        
+        # Filter by carrier status
+        if self.carrier_status and self.carrier_status != 'ALL':
+            if self.carrier_status == 'non-carrier':
+                filtered = [m for m in filtered if m.risk_allele_count() == 0]
+            elif self.carrier_status == 'heterozygous':
+                filtered = [m for m in filtered if m.risk_allele_count() == 1]
+            elif self.carrier_status == 'homozygous':
+                filtered = [m for m in filtered if m.risk_allele_count() == 2]
+            elif self.carrier_status == 'carrier':
+                filtered = [m for m in filtered if m.risk_allele_count() > 0]
         
         # Filter by search text (case-insensitive)
         if self.search_text:

@@ -9,10 +9,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QLineEdit,
     QComboBox, QSlider, QProgressBar, QStatusBar, QMessageBox,
-    QHeaderView, QGroupBox, QSpinBox, QFrame, QSplitter, QApplication
+    QHeaderView, QGroupBox, QSpinBox, QFrame, QSplitter, QApplication,
+    QDialog, QTextEdit, QScrollArea, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtGui import QFont, QColor, QDesktopServices
 
 from models.data_models import SNPRecord, GWASMatch, FilterCriteria
 from backend.parsers import Parser23andMe, ParseError
@@ -52,6 +53,16 @@ class ProcessingWorker(QThread):
             self.progress.emit(10, "Parsing 23andMe file...")
             
             parser = Parser23andMe()
+            
+            # Set up progress callback
+            def parsing_progress(lines_processed: int, total_lines: int) -> None:
+                if total_lines > 0:
+                    # Use 10-40% of progress for parsing
+                    progress_percent = 10 + int((lines_processed / total_lines) * 30)
+                    self.progress.emit(progress_percent, 
+                                      f"Parsing 23andMe file... ({lines_processed}/{total_lines} lines)")
+            
+            parser.set_progress_callback(parsing_progress)
             snp_records = parser.parse_file(self.filepath)
             stats = parser.get_parse_stats()
             
@@ -83,6 +94,332 @@ class ProcessingWorker(QThread):
     def cancel(self) -> None:
         """Cancel the processing operation."""
         self._is_cancelled = True
+
+
+class HelpDialog(QDialog):
+    """
+    Help dialog with scrollable explanation of the application.
+    """
+    
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Help - Genetic Analysis Application")
+        self.setMinimumSize(700, 600)
+        self._init_ui()
+    
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        # Scrollable text area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        
+        help_text = QTextEdit()
+        help_text.setReadOnly(True)
+        help_text.setHtml(self._get_help_content())
+        help_text.setMinimumHeight(500)
+        
+        content_layout.addWidget(help_text)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+        
+        # Close button
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+    
+    def _get_help_content(self) -> str:
+        return """
+        <h1>Genetic Analysis Application</h1>
+        <h2>What is this program?</h2>
+        <p>This application analyzes your raw genetic data from 23andMe and compares it against 
+        the <b>GWAS Catalog</b> (Genome-Wide Association Studies Catalog) - a curated database 
+        of genetic variants associated with various traits and diseases.</p>
+        
+        <h2>How does it work?</h2>
+        <ol>
+            <li><b>Upload your data:</b> Click "Upload 23andMe File" and select your raw data file 
+            (usually named something like "genome_Your_Name.txt")</li>
+            <li><b>Parsing:</b> The application reads your genetic variants (SNPs - Single Nucleotide Polymorphisms)</li>
+            <li><b>Matching:</b> Each of your SNPs is compared against the GWAS database to find associations</li>
+            <li><b>Scoring:</b> An Impact Score (0-10) is calculated for each match based on statistical significance</li>
+            <li><b>Results:</b> Matches are displayed in a sortable, filterable table</li>
+        </ol>
+        
+        <h2>Table Columns Explained</h2>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+            <tr style="background-color: #e0e0e0;">
+                <th>Column</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><b>SNP ID</b></td>
+                <td>The unique identifier for the genetic variant (e.g., rs6983267). 
+                The "rs" prefix stands for "Reference SNP".</td>
+            </tr>
+            <tr>
+                <td><b>Gene</b></td>
+                <td>The gene where this variant is located or nearest to. 
+                Genes are segments of DNA that encode proteins.</td>
+            </tr>
+            <tr>
+                <td><b>Trait</b></td>
+                <td>The disease, condition, or characteristic associated with this variant 
+                according to published GWAS studies.</td>
+            </tr>
+            <tr>
+                <td><b>User Genotype</b></td>
+                <td>YOUR specific genotype at this position. You have two copies (alleles) - 
+                one from each parent. E.g., "AG" means you have one A and one G allele.</td>
+            </tr>
+            <tr>
+                <td><b>Risk Allele</b></td>
+                <td>The allele (A, T, C, or G) associated with increased risk or effect 
+                for the trait. If your genotype contains this allele, it's highlighted in red.</td>
+            </tr>
+            <tr>
+                <td><b>P-value</b></td>
+                <td>Statistical significance of the association. Lower = more significant. 
+                Values like 1e-10 mean 0.0000000001. Generally, p < 5e-8 is considered genome-wide significant.</td>
+            </tr>
+            <tr>
+                <td><b>Category</b></td>
+                <td>Classification of the trait: Metabolic, Cardiovascular, Neuropsychiatric, 
+                Physical Trait, Oncology, Immune, Infectious, or Other.</td>
+            </tr>
+            <tr>
+                <td><b>Impact Score</b></td>
+                <td>A calculated score from 0-10 combining p-value significance and allele rarity. 
+                Higher scores indicate potentially more impactful variants. 
+                <br><br>Formula: Score = (P-value component × 7) + (Rarity component × 3)
+                <br>- P-value component: Based on -log10(p-value)
+                <br>- Rarity component: Based on how rare the variant is in the population</td>
+            </tr>
+            <tr>
+                <td><b>Interpretation</b></td>
+                <td>Human-readable interpretation of the impact score:
+                <br>- Very High Impact (≥8): Strong statistical association
+                <br>- High Impact (6-8): Significant association  
+                <br>- Moderate Impact (4-6): Notable association
+                <br>- Low Impact (2-4): Weak association
+                <br>- Minimal Impact (<2): Very weak association</td>
+            </tr>
+            <tr>
+                <td><b>Explain</b></td>
+                <td>Click this button to see detailed information about that specific result, 
+                including how the score was calculated and links for further research.</td>
+            </tr>
+        </table>
+        
+        <h2>Using Filters</h2>
+        <ul>
+            <li><b>Min Impact Score:</b> Show only results above this threshold</li>
+            <li><b>Max P-value:</b> Show only results with statistical significance below this value</li>
+            <li><b>Category:</b> Filter by trait category</li>
+            <li><b>Search:</b> Free text search in traits, genes, and SNP IDs</li>
+        </ul>
+        
+        <h2>Important Disclaimer</h2>
+        <p style="color: #b00000;"><b>⚠️ This application is for educational and informational purposes only.</b></p>
+        <p>The results should NOT be used for medical diagnosis or treatment decisions. 
+        Genetic associations are complex and influenced by many factors including:</p>
+        <ul>
+            <li>Environment and lifestyle</li>
+            <li>Gene-gene interactions</li>
+            <li>Population-specific effects</li>
+            <li>Incomplete scientific understanding</li>
+        </ul>
+        <p>Always consult with qualified healthcare professionals and genetic counselors 
+        for interpretation of genetic data.</p>
+        
+        <h2>Data Sources</h2>
+        <ul>
+            <li><b>GWAS Catalog:</b> <a href="https://www.ebi.ac.uk/gwas/">https://www.ebi.ac.uk/gwas/</a></li>
+            <li><b>dbSNP:</b> <a href="https://www.ncbi.nlm.nih.gov/snp/">https://www.ncbi.nlm.nih.gov/snp/</a></li>
+            <li><b>gnomAD (allele frequencies):</b> <a href="https://gnomad.broadinstitute.org/">https://gnomad.broadinstitute.org/</a></li>
+        </ul>
+        """
+
+
+class ExplainDialog(QDialog):
+    """
+    Dialog showing detailed explanation for a specific GWAS match.
+    """
+    
+    def __init__(self, match: GWASMatch, parent=None) -> None:
+        super().__init__(parent)
+        self.match = match
+        self.setWindowTitle(f"Details: {match.rsid} - {match.trait[:50]}")
+        self.setMinimumSize(650, 550)
+        self._init_ui()
+    
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        # Scrollable content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        
+        explain_text = QTextEdit()
+        explain_text.setReadOnly(True)
+        explain_text.setHtml(self._get_explanation())
+        explain_text.setMinimumHeight(400)
+        
+        content_layout.addWidget(explain_text)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        # External links
+        dbsnp_btn = QPushButton("🔗 Open in dbSNP")
+        dbsnp_btn.clicked.connect(self._open_dbsnp)
+        button_layout.addWidget(dbsnp_btn)
+        
+        gwas_btn = QPushButton("🔗 Open in GWAS Catalog")
+        gwas_btn.clicked.connect(self._open_gwas_catalog)
+        button_layout.addWidget(gwas_btn)
+        
+        if self.match.gene:
+            gene_btn = QPushButton(f"🔗 Gene: {self.match.gene}")
+            gene_btn.clicked.connect(self._open_gene_info)
+            button_layout.addWidget(gene_btn)
+        
+        button_layout.addStretch()
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def _get_explanation(self) -> str:
+        m = self.match
+        
+        # Calculate score components for explanation
+        import math
+        neg_log_p = -math.log10(m.p_value) if m.p_value > 0 else 0
+        p_score = min(neg_log_p / 10, 1.0) * 7.0
+        af_score = (1 - m.allele_frequency) * 3.0
+        
+        # Risk allele analysis
+        has_risk = m.risk_allele in m.user_genotype
+        risk_count = m.user_genotype.count(m.risk_allele)
+        if risk_count == 2:
+            risk_status = f"<span style='color: #b00000;'><b>Homozygous for risk allele</b> (2 copies)</span>"
+        elif risk_count == 1:
+            risk_status = f"<span style='color: #b06000;'><b>Heterozygous</b> (1 copy of risk allele)</span>"
+        else:
+            risk_status = "<span style='color: #006000;'><b>No risk allele</b> (0 copies)</span>"
+        
+        # Format odds ratio
+        odds_ratio_str = f"{m.odds_ratio:.2f}" if m.odds_ratio else "Not available"
+        
+        # Format sample size
+        sample_size_str = f"{m.sample_size:,} individuals" if m.sample_size else "Not available"
+        
+        return f"""
+        <h2>Variant Information</h2>
+        <table border="0" cellpadding="5" style="width: 100%;">
+            <tr><td><b>SNP ID:</b></td><td>{m.rsid}</td></tr>
+            <tr><td><b>Chromosome:</b></td><td>{m.chromosome}</td></tr>
+            <tr><td><b>Position:</b></td><td>{m.position:,}</td></tr>
+            <tr><td><b>Gene:</b></td><td>{m.gene or 'Intergenic (not in a gene)'}</td></tr>
+        </table>
+        
+        <h2>Association Details</h2>
+        <table border="0" cellpadding="5" style="width: 100%;">
+            <tr><td><b>Associated Trait:</b></td><td>{m.trait}</td></tr>
+            <tr><td><b>Category:</b></td><td>{m.category}</td></tr>
+            <tr><td><b>Risk Allele:</b></td><td>{m.risk_allele}</td></tr>
+            <tr><td><b>Odds Ratio:</b></td><td>{odds_ratio_str}</td></tr>
+            <tr><td><b>Study Sample Size:</b></td><td>{sample_size_str}</td></tr>
+        </table>
+        
+        <h2>Your Genotype Analysis</h2>
+        <table border="0" cellpadding="5" style="width: 100%;">
+            <tr><td><b>Your Genotype:</b></td><td><b style="font-size: 14pt;">{m.user_genotype}</b></td></tr>
+            <tr><td><b>Risk Allele Status:</b></td><td>{risk_status}</td></tr>
+        </table>
+        
+        <h2>Statistical Significance</h2>
+        <table border="0" cellpadding="5" style="width: 100%;">
+            <tr><td><b>P-value:</b></td><td>{m.p_value:.2e}</td></tr>
+            <tr><td><b>-log₁₀(p-value):</b></td><td>{neg_log_p:.2f}</td></tr>
+            <tr><td><b>Interpretation:</b></td><td>
+                {'Highly significant (p < 5×10⁻⁸)' if m.p_value < 5e-8 else 
+                 'Significant (p < 0.001)' if m.p_value < 0.001 else
+                 'Suggestive (p < 0.05)' if m.p_value < 0.05 else 'Not significant'}</td></tr>
+        </table>
+        
+        <h2>Population Frequency</h2>
+        <table border="0" cellpadding="5" style="width: 100%;">
+            <tr><td><b>Allele Frequency:</b></td><td>{m.allele_frequency:.1%}</td></tr>
+            <tr><td><b>Interpretation:</b></td><td>
+                {'Very rare variant (<1%)' if m.allele_frequency < 0.01 else
+                 'Rare variant (1-5%)' if m.allele_frequency < 0.05 else
+                 'Low frequency (5-10%)' if m.allele_frequency < 0.10 else
+                 'Common variant (≥10%)'}</td></tr>
+        </table>
+        
+        <h2>Impact Score Calculation</h2>
+        <p>The Impact Score combines statistical significance with variant rarity:</p>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+            <tr style="background-color: #e0e0e0;">
+                <th>Component</th>
+                <th>Formula</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>P-value Score</td>
+                <td>min(-log₁₀(p) / 10, 1) × 7</td>
+                <td>{p_score:.2f}</td>
+            </tr>
+            <tr>
+                <td>Rarity Score</td>
+                <td>(1 - allele_frequency) × 3</td>
+                <td>{af_score:.2f}</td>
+            </tr>
+            <tr style="background-color: #ffffcc;">
+                <td><b>Total Impact Score</b></td>
+                <td>P-value + Rarity (clamped 0-10)</td>
+                <td><b>{m.impact_score:.2f}</b></td>
+            </tr>
+        </table>
+        
+        <h2>What This Means</h2>
+        <p>This variant ({m.rsid}) has been associated with <b>{m.trait}</b> in genome-wide 
+        association studies{f' involving {m.sample_size:,} participants' if m.sample_size else ''}.</p>
+        
+        {'<p style="color: #b00000;">⚠️ You carry ' + str(risk_count) + ' cop' + ('y' if risk_count == 1 else 'ies') + 
+         ' of the risk allele. This may indicate a slightly increased statistical risk, but genetics is only one factor among many.</p>' 
+         if has_risk else 
+         '<p style="color: #006000;">✓ You do not carry the risk allele for this association.</p>'}
+        
+        <p><b>Remember:</b> Statistical association does not mean causation. Many genetic 
+        and environmental factors influence traits and disease risk. Consult healthcare 
+        professionals for personalized interpretation.</p>
+        """
+    
+    def _open_dbsnp(self) -> None:
+        url = f"https://www.ncbi.nlm.nih.gov/snp/{self.match.rsid}"
+        QDesktopServices.openUrl(QUrl(url))
+    
+    def _open_gwas_catalog(self) -> None:
+        url = f"https://www.ebi.ac.uk/gwas/variants/{self.match.rsid}"
+        QDesktopServices.openUrl(QUrl(url))
+    
+    def _open_gene_info(self) -> None:
+        if self.match.gene:
+            url = f"https://www.genecards.org/cgi-bin/carddisp.pl?gene={self.match.gene}"
+            QDesktopServices.openUrl(QUrl(url))
 
 
 class MainWindow(QMainWindow):
@@ -129,6 +466,12 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_label)
         
         header_layout.addStretch()
+        
+        self.help_btn = QPushButton("❓ Help")
+        self.help_btn.setMinimumWidth(80)
+        self.help_btn.setMinimumHeight(40)
+        self.help_btn.setFont(QFont('Arial', 11))
+        header_layout.addWidget(self.help_btn)
         
         self.upload_btn = QPushButton("📁 Upload 23andMe File")
         self.upload_btn.setMinimumWidth(200)
@@ -196,6 +539,15 @@ class MainWindow(QMainWindow):
         category_group.addWidget(self.category_combo)
         filter_row1.addLayout(category_group)
         
+        # Carrier status filter
+        carrier_group = QVBoxLayout()
+        carrier_label = QLabel("Carrier Status:")
+        self.carrier_combo = QComboBox()
+        self.carrier_combo.addItems(['ALL', 'non-carrier', 'heterozygous', 'homozygous', 'carrier'])
+        carrier_group.addWidget(carrier_label)
+        carrier_group.addWidget(self.carrier_combo)
+        filter_row1.addLayout(carrier_group)
+        
         filters_layout.addLayout(filter_row1)
         
         # Second row - search
@@ -222,10 +574,10 @@ class MainWindow(QMainWindow):
         
         # Results table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(9)
+        self.results_table.setColumnCount(10)
         self.results_table.setHorizontalHeaderLabels([
             "SNP ID", "Gene", "Trait", "User Genotype", 
-            "Risk Allele", "P-value", "Category", "Impact Score", "Interpretation"
+            "Risk Allele", "P-value", "Category", "Impact Score", "Interpretation", ""
         ])
         
         header = self.results_table.horizontalHeader()
@@ -238,6 +590,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
         
         self.results_table.setSortingEnabled(True)
         self.results_table.setAlternatingRowColors(True)
@@ -346,6 +699,7 @@ class MainWindow(QMainWindow):
     def _setup_connections(self) -> None:
         """Set up signal-slot connections."""
         self.upload_btn.clicked.connect(self._on_upload_clicked)
+        self.help_btn.clicked.connect(self._on_help_clicked)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         self.prev_btn.clicked.connect(self._on_prev_page)
         self.next_btn.clicked.connect(self._on_next_page)
@@ -355,6 +709,7 @@ class MainWindow(QMainWindow):
         self.score_slider.valueChanged.connect(self._on_score_changed)
         self.pvalue_slider.valueChanged.connect(self._on_pvalue_changed)
         self.category_combo.currentTextChanged.connect(self._apply_filters)
+        self.carrier_combo.currentTextChanged.connect(self._apply_filters)
         self.search_input.textChanged.connect(self._on_search_changed)
         
         # Debounce timer for search
@@ -485,6 +840,7 @@ class MainWindow(QMainWindow):
             min_score=min_score,
             max_pvalue=max_pvalue,
             category=self.category_combo.currentText(),
+            carrier_status=self.carrier_combo.currentText(),
             search_text=self.search_input.text().strip(),
             sort_by='score',
             sort_ascending=False
@@ -505,6 +861,7 @@ class MainWindow(QMainWindow):
         self.score_slider.setValue(0)
         self.pvalue_slider.setValue(100)
         self.category_combo.setCurrentIndex(0)
+        self.carrier_combo.setCurrentIndex(0)
         self.search_input.clear()
         
         self.filtered_matches = list(self.all_matches)
@@ -576,6 +933,34 @@ class MainWindow(QMainWindow):
                 item.setFont(QFont('Arial', 10, QFont.Weight.Bold))
             
             self.results_table.setItem(row, col, item)
+        
+        # Add Explain button in last column
+        explain_btn = QPushButton("🔍 Explain")
+        explain_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5cb85c;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #449d44;
+            }
+        """)
+        explain_btn.clicked.connect(lambda checked, m=match: self._show_explain_dialog(m))
+        self.results_table.setCellWidget(row, 9, explain_btn)
+    
+    def _show_explain_dialog(self, match: GWASMatch) -> None:
+        """Show the explain dialog for a specific match."""
+        dialog = ExplainDialog(match, self)
+        dialog.exec()
+    
+    def _on_help_clicked(self) -> None:
+        """Show the help dialog."""
+        dialog = HelpDialog(self)
+        dialog.exec()
     
     def _on_prev_page(self) -> None:
         """Go to previous page."""
