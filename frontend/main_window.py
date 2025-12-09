@@ -1,7 +1,7 @@
 """
 Main window UI for the Genetic Analysis Application.
 
-Implements PyQt6 interface with file upload, results table, filters, and search.
+Implements PyQt6 interface with tabbed layout for monogenic and polygenic analysis.
 """
 
 from typing import List, Optional
@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QLineEdit,
     QComboBox, QSlider, QProgressBar, QStatusBar, QMessageBox,
     QHeaderView, QGroupBox, QSpinBox, QFrame, QSplitter, QApplication,
-    QDialog, QTextEdit, QScrollArea, QDialogButtonBox
+    QDialog, QTextEdit, QScrollArea, QDialogButtonBox, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QDesktopServices
@@ -19,6 +19,9 @@ from models.data_models import SNPRecord, GWASMatch, FilterCriteria
 from backend.parsers import Parser23andMe, ParseError
 from backend.search_engine import SearchEngine, DatabaseError
 from backend.scoring import get_score_interpretation
+from frontend.polygenic_widgets import (
+    PolygenicBrowserWidget, DatabaseSettingsWidget
+)
 from config import (
     DATABASE_PATH, RESULTS_PER_PAGE, TRAIT_CATEGORIES,
     APP_NAME, APP_VERSION
@@ -33,11 +36,11 @@ class ProcessingWorker(QThread):
     Background worker thread for processing 23andMe files.
     
     Signals:
-        finished: Emitted when processing is complete with results.
+        finished: Emitted when processing is complete with results (matches, stats, snp_records).
         error: Emitted when an error occurs.
         progress: Emitted with progress updates (0-100).
     """
-    finished = pyqtSignal(list, dict)
+    finished = pyqtSignal(list, dict, list)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, str)
     
@@ -79,7 +82,7 @@ class ProcessingWorker(QThread):
             self.progress.emit(100, "Processing complete!")
             
             stats['matches_found'] = len(matches)
-            self.finished.emit(matches, stats)
+            self.finished.emit(matches, stats, snp_records)
             
         except ParseError as e:
             logger.error(f"Parse error: {e}")
@@ -427,7 +430,8 @@ class MainWindow(QMainWindow):
     Main application window for the Genetic Analysis Application.
     
     Provides:
-    - File upload for 23andMe data
+    - Tabbed interface for monogenic and polygenic analysis
+    - File upload for 23andMe data (shared between tabs)
     - Results table with sorting and pagination
     - Real-time filtering by score, p-value, category, and text search
     """
@@ -439,6 +443,7 @@ class MainWindow(QMainWindow):
         self.filtered_matches: List[GWASMatch] = []
         self.current_page = 0
         self.worker: Optional[ProcessingWorker] = None
+        self.snp_records: List[SNPRecord] = []
         
         self.search_engine = SearchEngine(DATABASE_PATH)
         
@@ -447,7 +452,7 @@ class MainWindow(QMainWindow):
         self._verify_database()
     
     def _init_ui(self) -> None:
-        """Initialize the user interface."""
+        """Initialize the user interface with tabbed layout."""
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 800)
         
@@ -458,7 +463,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(15, 15, 15, 15)
         
-        # Header section
+        # Header section with upload controls (shared across tabs)
         header_layout = QHBoxLayout()
         
         title_label = QLabel(APP_NAME)
@@ -466,6 +471,13 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_label)
         
         header_layout.addStretch()
+        
+        # Genotype status indicator
+        self.genotype_status = QLabel("No genetic data loaded")
+        self.genotype_status.setStyleSheet("color: #666; font-style: italic;")
+        header_layout.addWidget(self.genotype_status)
+        
+        header_layout.addWidget(QLabel(" | "))
         
         self.help_btn = QPushButton("❓ Help")
         self.help_btn.setMinimumWidth(80)
@@ -481,7 +493,7 @@ class MainWindow(QMainWindow):
         
         main_layout.addLayout(header_layout)
         
-        # Progress section
+        # Progress section (shared)
         self.progress_frame = QFrame()
         self.progress_frame.setVisible(False)
         progress_layout = QVBoxLayout(self.progress_frame)
@@ -498,6 +510,37 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.cancel_btn)
         
         main_layout.addWidget(self.progress_frame)
+        
+        # Tab widget
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setFont(QFont('Arial', 11))
+        
+        # Tab 1: Monogenic Analysis (existing functionality)
+        self.monogenic_tab = QWidget()
+        self._init_monogenic_tab()
+        self.tab_widget.addTab(self.monogenic_tab, "🧬 Monogenic Analysis")
+        
+        # Tab 2: Polygenic Analysis (new)
+        self.polygenic_widget = PolygenicBrowserWidget()
+        self.tab_widget.addTab(self.polygenic_widget, "📊 Polygenic Scores")
+        
+        # Tab 3: Database Settings
+        self.settings_widget = DatabaseSettingsWidget()
+        self.tab_widget.addTab(self.settings_widget, "⚙️ Database Settings")
+        
+        main_layout.addWidget(self.tab_widget, stretch=1)
+        
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready - Upload a 23andMe file to begin")
+        
+        self._apply_styles()
+    
+    def _init_monogenic_tab(self) -> None:
+        """Initialize the monogenic analysis tab content."""
+        layout = QVBoxLayout(self.monogenic_tab)
+        layout.setContentsMargins(0, 10, 0, 0)
         
         # Filters section
         self.filters_group = QGroupBox("Filters & Search")
@@ -564,13 +607,13 @@ class MainWindow(QMainWindow):
         
         filters_layout.addLayout(filter_row2)
         
-        main_layout.addWidget(self.filters_group)
+        layout.addWidget(self.filters_group)
         self.filters_group.setEnabled(False)
         
         # Results count label
         self.results_label = QLabel("No results to display")
         self.results_label.setFont(QFont('Arial', 11))
-        main_layout.addWidget(self.results_label)
+        layout.addWidget(self.results_label)
         
         # Results table
         self.results_table = QTableWidget()
@@ -595,7 +638,7 @@ class MainWindow(QMainWindow):
         self.results_table.setSortingEnabled(True)
         self.results_table.setAlternatingRowColors(True)
         
-        main_layout.addWidget(self.results_table, stretch=1)
+        layout.addWidget(self.results_table, stretch=1)
         
         # Pagination section
         pagination_layout = QHBoxLayout()
@@ -615,20 +658,34 @@ class MainWindow(QMainWindow):
         self.next_btn.setEnabled(False)
         pagination_layout.addWidget(self.next_btn)
         
-        main_layout.addLayout(pagination_layout)
-        
-        # Status bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready - Upload a 23andMe file to begin")
-        
-        self._apply_styles()
+        layout.addLayout(pagination_layout)
     
     def _apply_styles(self) -> None:
         """Apply stylesheet to the application."""
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #f5f5f5;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #e0e0e0;
+                border: 1px solid #ccc;
+                border-bottom: none;
+                padding: 10px 20px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 1px solid white;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #d0d0d0;
             }
             QGroupBox {
                 font-weight: bold;
@@ -764,18 +821,26 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
         self.status_bar.showMessage(message)
     
-    def _on_processing_finished(self, matches: List[GWASMatch], stats: dict) -> None:
+    def _on_processing_finished(self, matches: List[GWASMatch], stats: dict, snp_records: List[SNPRecord]) -> None:
         """Handle successful processing completion."""
         self.progress_frame.setVisible(False)
         self.upload_btn.setEnabled(True)
         self.filters_group.setEnabled(True)
         
         self.all_matches = matches
+        self.snp_records = snp_records
         self.current_page = 0
         
         logger.info(f"Processing complete: {stats}")
         
         self._reset_filters()
+        
+        # Update genotype status indicator
+        self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
+        self.genotype_status.setStyleSheet("color: #006000; font-weight: bold;")
+        
+        # Share genotype data with polygenic analysis tab
+        self.polygenic_widget.set_genotype_data(snp_records)
         
         self.status_bar.showMessage(
             f"Loaded {stats.get('valid_snps', 0)} SNPs | "

@@ -1,0 +1,11 @@
+When i load my genome data, I get only 8 computed scores - I was expecting all of the 660 traits and thousands of scores in PGS Catalog. Please review and fix that, if it should be fixed (if this is a limitation of my specific genome data, and I would get other computed traits with another individual's genome, then there may be nothing to fix. 
+
+Also, in the polygenic score details: 
+- please merge groups "Your results" and "Population distribution" in a same row ("your results" first/to the left);
+- please merge ("Scientific context" and "quality information") also in a same row. 
+- within the same group, please remove empty lines and/or reduce vertical spacing between lines.
+- make sure these changes should leave more space for the top contribution variants table.
+- in "scientific context", the DOI link should be clickable, but there should be other relevant links
+- each row of the "top contributing variants" should have different clickable links relevant to the variant
+ 	 
+
