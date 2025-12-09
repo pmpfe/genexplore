@@ -493,16 +493,19 @@ class PolygenicDatabase:
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            # Use columns that exist in the actual database schema
+            # Map 'ancestry' to 'study_population', use publication_title as description
             cursor.execute("""
                 SELECT pgs_id, trait_name, trait_category, publication_doi,
-                       publication_year, study_population, sample_size, num_variants, description
+                       publication_year, ancestry, sample_size, num_variants, publication_title
                 FROM polygenic_scores
+                WHERE download_status = 'complete'
                 ORDER BY trait_name
             """)
             
             for row in cursor.fetchall():
                 try:
-                    category = TraitCategory(row['trait_category'])
+                    category = TraitCategory(row['trait_category']) if row['trait_category'] else TraitCategory.OTHER
                 except ValueError:
                     category = TraitCategory.OTHER
                 
@@ -512,10 +515,10 @@ class PolygenicDatabase:
                     trait_category=category,
                     publication_doi=row['publication_doi'],
                     publication_year=row['publication_year'],
-                    study_population=row['study_population'],
+                    study_population=row['ancestry'],  # Map ancestry to study_population
                     sample_size=row['sample_size'],
                     num_variants=row['num_variants'],
-                    description=row['description'],
+                    description=row['publication_title'] or '',  # Use publication_title as description
                     variants=[]  # Loaded separately for performance
                 )
                 scores.append(score)
@@ -535,10 +538,10 @@ class PolygenicDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # Get score metadata
+            # Get score metadata (using actual database schema)
             cursor.execute("""
                 SELECT pgs_id, trait_name, trait_category, publication_doi,
-                       publication_year, study_population, sample_size, num_variants, description
+                       publication_year, ancestry, sample_size, num_variants, publication_title
                 FROM polygenic_scores WHERE pgs_id = ?
             """, (pgs_id,))
             
@@ -547,27 +550,27 @@ class PolygenicDatabase:
                 return None
             
             try:
-                category = TraitCategory(row['trait_category'])
+                category = TraitCategory(row['trait_category']) if row['trait_category'] else TraitCategory.OTHER
             except ValueError:
                 category = TraitCategory.OTHER
             
-            # Get variants
+            # Get variants (using actual database schema)
             cursor.execute("""
                 SELECT rsid, chromosome, position, effect_allele, other_allele,
-                       effect_weight, effect_allele_frequency
+                       effect_weight, allele_frequency
                 FROM pgs_variants WHERE pgs_id = ?
             """, (pgs_id,))
             
             variants = []
             for v_row in cursor.fetchall():
                 variant = PolygenicVariant(
-                    rsid=v_row['rsid'],
+                    rsid=v_row['rsid'] or "",
                     chromosome=v_row['chromosome'] or "",
                     position=v_row['position'] or 0,
-                    effect_allele=v_row['effect_allele'],
+                    effect_allele=v_row['effect_allele'] or "",
                     other_allele=v_row['other_allele'] or "",
                     effect_weight=v_row['effect_weight'],
-                    effect_allele_frequency=v_row['effect_allele_frequency']
+                    effect_allele_frequency=v_row['allele_frequency']  # Map column name
                 )
                 variants.append(variant)
             
@@ -577,10 +580,10 @@ class PolygenicDatabase:
                 trait_category=category,
                 publication_doi=row['publication_doi'],
                 publication_year=row['publication_year'],
-                study_population=row['study_population'],
+                study_population=row['ancestry'],  # Map ancestry to study_population
                 sample_size=row['sample_size'],
                 num_variants=row['num_variants'],
-                description=row['description'],
+                description=row['publication_title'] or '',  # Use publication_title as description
                 variants=variants
             )
     
@@ -714,10 +717,10 @@ class PolygenicDatabase:
             )
     
     def get_score_count(self) -> int:
-        """Get total number of polygenic scores."""
+        """Get total number of complete polygenic scores."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM polygenic_scores")
+            cursor.execute("SELECT COUNT(*) FROM polygenic_scores WHERE download_status = 'complete'")
             return cursor.fetchone()[0]
 
 

@@ -38,11 +38,13 @@ class ProcessingWorker(QThread):
     Signals:
         finished: Emitted when processing is complete with results (matches, stats, snp_records).
         error: Emitted when an error occurs.
-        progress: Emitted with progress updates (0-100).
+        file_progress: Emitted with file loading progress (0-100, message).
+        mono_progress: Emitted with monogenic analysis progress (0-100, message).
     """
     finished = pyqtSignal(list, dict, list)
     error = pyqtSignal(str)
-    progress = pyqtSignal(int, str)
+    file_progress = pyqtSignal(int, str)
+    mono_progress = pyqtSignal(int, str)
     
     def __init__(self, filepath: str, search_engine: SearchEngine) -> None:
         super().__init__()
@@ -53,33 +55,36 @@ class ProcessingWorker(QThread):
     def run(self) -> None:
         """Execute the processing pipeline."""
         try:
-            self.progress.emit(10, "Parsing 23andMe file...")
+            self.file_progress.emit(5, "Opening file...")
+            self.mono_progress.emit(0, "Waiting...")
             
             parser = Parser23andMe()
             
-            # Set up progress callback
+            # Set up progress callback for file parsing
             def parsing_progress(lines_processed: int, total_lines: int) -> None:
                 if total_lines > 0:
-                    # Use 10-40% of progress for parsing
-                    progress_percent = 10 + int((lines_processed / total_lines) * 30)
-                    self.progress.emit(progress_percent, 
-                                      f"Parsing 23andMe file... ({lines_processed}/{total_lines} lines)")
+                    progress_percent = int((lines_processed / total_lines) * 100)
+                    self.file_progress.emit(progress_percent, 
+                                           f"{lines_processed:,}/{total_lines:,} lines")
             
             parser.set_progress_callback(parsing_progress)
             snp_records = parser.parse_file(self.filepath)
             stats = parser.get_parse_stats()
             
+            self.file_progress.emit(100, f"✓ {len(snp_records):,} SNPs loaded")
+            
             if self._is_cancelled:
                 return
             
-            self.progress.emit(50, f"Matching {len(snp_records)} SNPs against GWAS database...")
+            # Monogenic analysis
+            self.mono_progress.emit(10, f"Matching {len(snp_records):,} SNPs...")
             
             matches = self.search_engine.match_user_snps(snp_records)
             
             if self._is_cancelled:
                 return
             
-            self.progress.emit(100, "Processing complete!")
+            self.mono_progress.emit(100, f"✓ {len(matches):,} matches found")
             
             stats['matches_found'] = len(matches)
             self.finished.emit(matches, stats, snp_records)
@@ -137,22 +142,54 @@ class HelpDialog(QDialog):
     def _get_help_content(self) -> str:
         return """
         <h1>Genetic Analysis Application</h1>
-        <h2>What is this program?</h2>
-        <p>This application analyzes your raw genetic data from 23andMe and compares it against 
-        the <b>GWAS Catalog</b> (Genome-Wide Association Studies Catalog) - a curated database 
-        of genetic variants associated with various traits and diseases.</p>
         
-        <h2>How does it work?</h2>
+        <h2>What is this program?</h2>
+        <p>This application analyzes your raw genetic data from 23andMe and provides two types of analysis:</p>
+        <ul>
+            <li><b>Monogenic Analysis:</b> Identifies individual genetic variants (SNPs) associated with traits 
+            and diseases using the GWAS Catalog.</li>
+            <li><b>Polygenic Analysis:</b> Calculates Polygenic Risk Scores (PRS) that combine the effects of 
+            many genetic variants to predict your genetic predisposition for complex traits.</li>
+        </ul>
+        
+        <h2>Types of Analysis</h2>
+        
+        <h3>🧬 Monogenic Analysis (GWAS)</h3>
+        <p>This analysis looks at individual SNPs and their associations with traits. Each variant is 
+        analyzed independently using data from the <b>GWAS Catalog</b> - a curated database of genome-wide 
+        association studies.</p>
+        <p>Results show individual variants with their statistical significance (p-value) and an 
+        Impact Score (0-10) that combines significance with allele rarity.</p>
+        
+        <h3>📊 Polygenic Analysis (PRS)</h3>
+        <p>Polygenic Risk Scores aggregate the effects of many genetic variants to estimate your 
+        genetic predisposition for complex traits like height, BMI, or disease risk.</p>
+        <p>Unlike monogenic analysis, PRS considers that most traits are influenced by hundreds or 
+        thousands of variants, each with a small effect. The combined score provides a more 
+        comprehensive picture of genetic risk.</p>
+        <p><b>How PRS is calculated:</b></p>
         <ol>
-            <li><b>Upload your data:</b> Click "Upload 23andMe File" and select your raw data file 
-            (usually named something like "genome_Your_Name.txt")</li>
-            <li><b>Parsing:</b> The application reads your genetic variants (SNPs - Single Nucleotide Polymorphisms)</li>
-            <li><b>Matching:</b> Each of your SNPs is compared against the GWAS database to find associations</li>
-            <li><b>Scoring:</b> An Impact Score (0-10) is calculated for each match based on statistical significance</li>
-            <li><b>Results:</b> Matches are displayed in a sortable, filterable table</li>
+            <li>For each variant in the score, your genotype is matched against the effect allele</li>
+            <li>Each match contributes a weight (beta value) derived from scientific studies</li>
+            <li>The weighted sum produces your raw polygenic score</li>
+            <li>Scores are converted to percentiles based on population distributions</li>
         </ol>
         
-        <h2>Table Columns Explained</h2>
+        <h2>How to Use</h2>
+        <ol>
+            <li><b>Upload your data:</b> Click "Upload 23andMe File" and select your raw data file</li>
+            <li><b>Wait for analysis:</b> Three progress bars show:
+                <ul>
+                    <li>📁 File loading progress</li>
+                    <li>🧬 Monogenic (GWAS) analysis progress</li>
+                    <li>📊 Polygenic (PRS) analysis progress</li>
+                </ul>
+            </li>
+            <li><b>Explore results:</b> Use the tabs to switch between Monogenic and Polygenic views</li>
+            <li><b>Filter and search:</b> Use the filter controls to find specific traits or categories</li>
+        </ol>
+        
+        <h2>Understanding Monogenic Results</h2>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
             <tr style="background-color: #e0e0e0;">
                 <th>Column</th>
@@ -160,89 +197,172 @@ class HelpDialog(QDialog):
             </tr>
             <tr>
                 <td><b>SNP ID</b></td>
-                <td>The unique identifier for the genetic variant (e.g., rs6983267). 
-                The "rs" prefix stands for "Reference SNP".</td>
+                <td>The unique identifier (e.g., rs6983267). "rs" = Reference SNP.</td>
             </tr>
             <tr>
                 <td><b>Gene</b></td>
-                <td>The gene where this variant is located or nearest to. 
-                Genes are segments of DNA that encode proteins.</td>
+                <td>The gene where this variant is located or nearest to.</td>
             </tr>
             <tr>
                 <td><b>Trait</b></td>
-                <td>The disease, condition, or characteristic associated with this variant 
-                according to published GWAS studies.</td>
+                <td>The disease or characteristic associated with this variant.</td>
             </tr>
             <tr>
                 <td><b>User Genotype</b></td>
-                <td>YOUR specific genotype at this position. You have two copies (alleles) - 
-                one from each parent. E.g., "AG" means you have one A and one G allele.</td>
+                <td>Your genotype - two alleles, one from each parent (e.g., "AG").</td>
             </tr>
             <tr>
                 <td><b>Risk Allele</b></td>
-                <td>The allele (A, T, C, or G) associated with increased risk or effect 
-                for the trait. If your genotype contains this allele, it's highlighted in red.</td>
+                <td>The allele associated with increased risk/effect. Highlighted in red if present.</td>
             </tr>
             <tr>
                 <td><b>P-value</b></td>
-                <td>Statistical significance of the association. Lower = more significant. 
-                Values like 1e-10 mean 0.0000000001. Generally, p < 5e-8 is considered genome-wide significant.</td>
+                <td>Statistical significance. Lower = more significant. p < 5e-8 is genome-wide significant.</td>
             </tr>
             <tr>
                 <td><b>Category</b></td>
-                <td>Classification of the trait: Metabolic, Cardiovascular, Neuropsychiatric, 
-                Physical Trait, Oncology, Immune, Infectious, or Other.</td>
+                <td>Trait classification: Metabolic, Cardiovascular, Neuropsychiatric, Physical Trait, 
+                Oncology, Immune, Infectious, or Other.</td>
             </tr>
             <tr>
                 <td><b>Impact Score</b></td>
-                <td>A calculated score from 0-10 combining p-value significance and allele rarity. 
-                Higher scores indicate potentially more impactful variants. 
-                <br><br>Formula: Score = (P-value component × 7) + (Rarity component × 3)
-                <br>- P-value component: Based on -log10(p-value)
-                <br>- Rarity component: Based on how rare the variant is in the population</td>
+                <td>Score 0-10 combining p-value significance (70%) and allele rarity (30%).</td>
             </tr>
             <tr>
                 <td><b>Interpretation</b></td>
-                <td>Human-readable interpretation of the impact score:
-                <br>- Very High Impact (≥8): Strong statistical association
-                <br>- High Impact (6-8): Significant association  
-                <br>- Moderate Impact (4-6): Notable association
-                <br>- Low Impact (2-4): Weak association
-                <br>- Minimal Impact (<2): Very weak association</td>
+                <td>Very High (≥8), High (6-8), Moderate (4-6), Low (2-4), Minimal (<2).</td>
+            </tr>
+        </table>
+        
+        <h2>Understanding Polygenic Results</h2>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+            <tr style="background-color: #e0e0e0;">
+                <th>Column</th>
+                <th>Description</th>
             </tr>
             <tr>
-                <td><b>Explain</b></td>
-                <td>Click this button to see detailed information about that specific result, 
-                including how the score was calculated and links for further research.</td>
+                <td><b>Trait</b></td>
+                <td>The trait or condition for which the polygenic score was calculated.</td>
+            </tr>
+            <tr>
+                <td><b>Category</b></td>
+                <td>Classification of the trait type.</td>
+            </tr>
+            <tr>
+                <td><b>Raw Score</b></td>
+                <td>Your calculated polygenic score (sum of weighted allele effects).</td>
+            </tr>
+            <tr>
+                <td><b>Percentile</b></td>
+                <td>Where you fall in the population distribution (0-100%). 
+                Higher percentile = higher genetic predisposition.</td>
+            </tr>
+            <tr>
+                <td><b>Variants Used</b></td>
+                <td>Number of variants from the score that matched your data.</td>
+            </tr>
+            <tr>
+                <td><b>Risk Level</b></td>
+                <td>Visual indicator: 🟢 Low (<25%), 🟡 Average (25-75%), 🔴 High (>75%).</td>
             </tr>
         </table>
         
         <h2>Using Filters</h2>
         <ul>
-            <li><b>Min Impact Score:</b> Show only results above this threshold</li>
-            <li><b>Max P-value:</b> Show only results with statistical significance below this value</li>
+            <li><b>Min Impact Score:</b> Show only results above this threshold (Monogenic)</li>
+            <li><b>Max P-value:</b> Filter by statistical significance (Monogenic)</li>
             <li><b>Category:</b> Filter by trait category</li>
             <li><b>Search:</b> Free text search in traits, genes, and SNP IDs</li>
         </ul>
         
-        <h2>Important Disclaimer</h2>
-        <p style="color: #b00000;"><b>⚠️ This application is for educational and informational purposes only.</b></p>
+        <h2>⚠️ Important Disclaimer</h2>
+        <p style="color: #b00000;"><b>This application is for educational and informational purposes only.</b></p>
         <p>The results should NOT be used for medical diagnosis or treatment decisions. 
-        Genetic associations are complex and influenced by many factors including:</p>
+        Genetic associations are complex and influenced by many factors:</p>
         <ul>
-            <li>Environment and lifestyle</li>
-            <li>Gene-gene interactions</li>
-            <li>Population-specific effects</li>
-            <li>Incomplete scientific understanding</li>
+            <li><b>Environment and lifestyle</b> often have greater effects than genetics</li>
+            <li><b>Gene-gene interactions</b> are not fully captured</li>
+            <li><b>Population-specific effects</b> - scores may be less accurate for non-European ancestries</li>
+            <li><b>Scientific uncertainty</b> - our understanding of genetics continues to evolve</li>
         </ul>
-        <p>Always consult with qualified healthcare professionals and genetic counselors 
-        for interpretation of genetic data.</p>
+        <p><b>Always consult with qualified healthcare professionals and genetic counselors 
+        for interpretation of genetic data.</b></p>
         
         <h2>Data Sources</h2>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+            <tr style="background-color: #e0e0e0;">
+                <th>Source</th>
+                <th>Description</th>
+                <th>Link</th>
+            </tr>
+            <tr>
+                <td><b>GWAS Catalog</b></td>
+                <td>Curated database of genome-wide association studies, maintained by EMBL-EBI and NHGRI. 
+                Contains thousands of variant-trait associations from published research.</td>
+                <td><a href="https://www.ebi.ac.uk/gwas/">www.ebi.ac.uk/gwas/</a></td>
+            </tr>
+            <tr>
+                <td><b>PGS Catalog</b></td>
+                <td>Open database of polygenic scores and their metadata, including variant-level scoring files. 
+                Contains ~4,000 scores for ~660 traits with ~150 million variant weights.</td>
+                <td><a href="https://www.pgscatalog.org/">www.pgscatalog.org/</a></td>
+            </tr>
+            <tr>
+                <td><b>dbSNP</b></td>
+                <td>NCBI's database of genetic variation. Provides reference information for each SNP 
+                including genomic location and population frequencies.</td>
+                <td><a href="https://www.ncbi.nlm.nih.gov/snp/">www.ncbi.nlm.nih.gov/snp/</a></td>
+            </tr>
+            <tr>
+                <td><b>gnomAD</b></td>
+                <td>Genome Aggregation Database with allele frequencies from 140,000+ individuals. 
+                Used to assess how rare variants are in the general population.</td>
+                <td><a href="https://gnomad.broadinstitute.org/">gnomad.broadinstitute.org/</a></td>
+            </tr>
+            <tr>
+                <td><b>Ensembl</b></td>
+                <td>Genome database providing gene annotations, variant information, and cross-references 
+                to other databases.</td>
+                <td><a href="https://www.ensembl.org/">www.ensembl.org/</a></td>
+            </tr>
+            <tr>
+                <td><b>ClinVar</b></td>
+                <td>NCBI database of clinically relevant genetic variants and their relationships 
+                to human health.</td>
+                <td><a href="https://www.ncbi.nlm.nih.gov/clinvar/">www.ncbi.nlm.nih.gov/clinvar/</a></td>
+            </tr>
+        </table>
+        
+        <h2>Further Reading</h2>
         <ul>
-            <li><b>GWAS Catalog:</b> <a href="https://www.ebi.ac.uk/gwas/">https://www.ebi.ac.uk/gwas/</a></li>
-            <li><b>dbSNP:</b> <a href="https://www.ncbi.nlm.nih.gov/snp/">https://www.ncbi.nlm.nih.gov/snp/</a></li>
-            <li><b>gnomAD (allele frequencies):</b> <a href="https://gnomad.broadinstitute.org/">https://gnomad.broadinstitute.org/</a></li>
+            <li><b>Understanding GWAS:</b> <a href="https://www.genome.gov/genetics-glossary/Genome-Wide-Association-Studies">genome.gov - GWAS Glossary</a></li>
+            <li><b>Polygenic Scores Explained:</b> <a href="https://www.pgscatalog.org/about/">PGS Catalog - About</a></li>
+            <li><b>Genetics Education:</b> <a href="https://www.genome.gov/For-Patients-and-Families">NIH Genetics Education Resources</a></li>
+            <li><b>Scientific Papers:</b>
+                <ul>
+                    <li><a href="https://doi.org/10.1093/nar/gkaa1061">GWAS Catalog 2023 Update (Nucleic Acids Research)</a></li>
+                    <li><a href="https://doi.org/10.1038/s41588-021-00783-5">PGS Catalog Paper (Nature Genetics)</a></li>
+                </ul>
+            </li>
+        </ul>
+        
+        <h2>Database Updates</h2>
+        <p>To update the local databases with the latest data from GWAS Catalog and PGS Catalog, 
+        run the update script from the command line:</p>
+        <pre style="background-color: #f0f0f0; padding: 10px; border-radius: 5px;">
+python update_databases.py --all     # Update both databases
+python update_databases.py --gwas    # Update only GWAS
+python update_databases.py --pgs     # Update only PGS Catalog
+        </pre>
+        <p>This process downloads the latest data and may take several hours for the full PGS Catalog 
+        (~150 million variants).</p>
+        
+        <h2>Technical Information</h2>
+        <ul>
+            <li><b>Application Version:</b> 1.0.0</li>
+            <li><b>Supported Input Formats:</b> 23andMe raw data (.txt)</li>
+            <li><b>Database Format:</b> SQLite with optimized indexes</li>
+            <li><b>Source Code:</b> <a href="https://github.com/">Available on GitHub</a></li>
         </ul>
         """
 
@@ -493,21 +613,68 @@ class MainWindow(QMainWindow):
         
         main_layout.addLayout(header_layout)
         
-        # Progress section (shared)
+        # Progress section with 3 separate progress bars
         self.progress_frame = QFrame()
         self.progress_frame.setVisible(False)
-        progress_layout = QVBoxLayout(self.progress_frame)
+        progress_main_layout = QVBoxLayout(self.progress_frame)
+        progress_main_layout.setContentsMargins(0, 5, 0, 5)
+        progress_main_layout.setSpacing(5)
         
+        # Status label
         self.progress_label = QLabel("Processing...")
-        progress_layout.addWidget(self.progress_label)
+        progress_main_layout.addWidget(self.progress_label)
         
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        progress_layout.addWidget(self.progress_bar)
+        # Three progress bars in a horizontal layout
+        progress_bars_layout = QHBoxLayout()
+        progress_bars_layout.setSpacing(15)
+        
+        # 1. File parsing progress
+        file_progress_group = QVBoxLayout()
+        file_progress_group.setSpacing(2)
+        self.file_progress_label = QLabel("📁 File Loading")
+        self.file_progress_label.setFont(QFont('Arial', 9))
+        file_progress_group.addWidget(self.file_progress_label)
+        self.file_progress_bar = QProgressBar()
+        self.file_progress_bar.setRange(0, 100)
+        self.file_progress_bar.setMinimumWidth(200)
+        self.file_progress_bar.setMaximumHeight(20)
+        file_progress_group.addWidget(self.file_progress_bar)
+        progress_bars_layout.addLayout(file_progress_group)
+        
+        # 2. Monogenic analysis progress
+        mono_progress_group = QVBoxLayout()
+        mono_progress_group.setSpacing(2)
+        self.mono_progress_label = QLabel("🧬 Monogenic Analysis")
+        self.mono_progress_label.setFont(QFont('Arial', 9))
+        mono_progress_group.addWidget(self.mono_progress_label)
+        self.mono_progress_bar = QProgressBar()
+        self.mono_progress_bar.setRange(0, 100)
+        self.mono_progress_bar.setMinimumWidth(200)
+        self.mono_progress_bar.setMaximumHeight(20)
+        mono_progress_group.addWidget(self.mono_progress_bar)
+        progress_bars_layout.addLayout(mono_progress_group)
+        
+        # 3. Polygenic analysis progress
+        poly_progress_group = QVBoxLayout()
+        poly_progress_group.setSpacing(2)
+        self.poly_progress_label = QLabel("📊 Polygenic Analysis")
+        self.poly_progress_label.setFont(QFont('Arial', 9))
+        poly_progress_group.addWidget(self.poly_progress_label)
+        self.poly_progress_bar = QProgressBar()
+        self.poly_progress_bar.setRange(0, 100)
+        self.poly_progress_bar.setMinimumWidth(200)
+        self.poly_progress_bar.setMaximumHeight(20)
+        poly_progress_group.addWidget(self.poly_progress_bar)
+        progress_bars_layout.addLayout(poly_progress_group)
+        
+        progress_bars_layout.addStretch()
         
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setMaximumWidth(100)
-        progress_layout.addWidget(self.cancel_btn)
+        self.cancel_btn.setMaximumWidth(80)
+        self.cancel_btn.setMaximumHeight(35)
+        progress_bars_layout.addWidget(self.cancel_btn)
+        
+        progress_main_layout.addLayout(progress_bars_layout)
         
         main_layout.addWidget(self.progress_frame)
         
@@ -807,23 +974,52 @@ class MainWindow(QMainWindow):
         self.upload_btn.setEnabled(False)
         self.filters_group.setEnabled(False)
         self.progress_frame.setVisible(True)
-        self.progress_bar.setValue(0)
+        
+        # Initialize all progress bars
+        self.file_progress_bar.setValue(0)
+        self.mono_progress_bar.setValue(0)
+        self.poly_progress_bar.setValue(0)
+        self.file_progress_label.setText("📁 File Loading")
+        self.mono_progress_label.setText("🧬 Monogenic Analysis")
+        self.poly_progress_label.setText("📊 Polygenic Analysis")
+        self.progress_label.setText("Loading genetic data...")
         
         self.worker = ProcessingWorker(filepath, self.search_engine)
-        self.worker.progress.connect(self._on_progress)
+        self.worker.file_progress.connect(self._on_file_progress)
+        self.worker.mono_progress.connect(self._on_mono_progress)
         self.worker.finished.connect(self._on_processing_finished)
         self.worker.error.connect(self._on_processing_error)
         self.worker.start()
     
-    def _on_progress(self, value: int, message: str) -> None:
-        """Handle progress updates from worker."""
-        self.progress_bar.setValue(value)
-        self.progress_label.setText(message)
-        self.status_bar.showMessage(message)
+    def _on_file_progress(self, value: int, message: str) -> None:
+        """Handle file loading progress updates."""
+        self.file_progress_bar.setValue(value)
+        self.file_progress_label.setText(f"📁 {message}")
+        if value < 100:
+            self.progress_label.setText("Loading genetic data...")
+            self.status_bar.showMessage(f"File loading: {message}")
+    
+    def _on_mono_progress(self, value: int, message: str) -> None:
+        """Handle monogenic analysis progress updates."""
+        self.mono_progress_bar.setValue(value)
+        self.mono_progress_label.setText(f"🧬 {message}")
+        if value > 0 and value < 100:
+            self.progress_label.setText("Analyzing monogenic variants...")
+            self.status_bar.showMessage(f"Monogenic analysis: {message}")
+        elif value == 100:
+            self.progress_label.setText("Monogenic analysis complete!")
+    
+    def _on_poly_progress(self, current: int, total: int, message: str) -> None:
+        """Handle polygenic analysis progress updates."""
+        if total > 0:
+            percent = int(current / total * 100)
+            self.poly_progress_bar.setValue(percent)
+            self.poly_progress_label.setText(f"📊 {message}")
+            self.status_bar.showMessage(f"Polygenic: {current}/{total} scores")
     
     def _on_processing_finished(self, matches: List[GWASMatch], stats: dict, snp_records: List[SNPRecord]) -> None:
         """Handle successful processing completion."""
-        self.progress_frame.setVisible(False)
+        # Keep progress frame visible but enable interface
         self.upload_btn.setEnabled(True)
         self.filters_group.setEnabled(True)
         
@@ -839,14 +1035,76 @@ class MainWindow(QMainWindow):
         self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
         self.genotype_status.setStyleSheet("color: #006000; font-weight: bold;")
         
-        # Share genotype data with polygenic analysis tab
+        # Share genotype data with polygenic analysis tab and start background computation
         self.polygenic_widget.set_genotype_data(snp_records)
         
+        # Start polygenic computation in background (non-blocking)
+        self._start_polygenic_computation()
+        
         self.status_bar.showMessage(
-            f"Loaded {stats.get('valid_snps', 0)} SNPs | "
-            f"Found {stats.get('matches_found', 0)} GWAS matches | "
-            f"Skipped {stats.get('skipped_undetermined', 0)} undetermined"
+            f"Loaded {stats.get('valid_snps', 0):,} SNPs | "
+            f"Found {stats.get('matches_found', 0):,} GWAS matches | "
+            f"Polygenic computing in background..."
         )
+    
+    def _start_polygenic_computation(self) -> None:
+        """Start polygenic score computation in background."""
+        if not self.snp_records:
+            return
+        
+        # Update progress bar
+        self.poly_progress_bar.setValue(0)
+        self.poly_progress_label.setText("📊 Starting computation...")
+        self.progress_label.setText("Computing polygenic scores in background...")
+        
+        # Connect to polygenic widget's worker signals
+        self.polygenic_widget.compute_btn.setEnabled(False)
+        
+        # Start computation via the polygenic widget
+        # We hook into its signals for progress
+        if hasattr(self.polygenic_widget, 'worker') and self.polygenic_widget.worker:
+            self.polygenic_widget.worker.progress.connect(self._on_poly_progress)
+            self.polygenic_widget.worker.finished.connect(self._on_polygenic_finished)
+        
+        # Trigger computation
+        self.polygenic_widget._start_computation()
+        
+        # Re-connect signals after worker is created
+        if self.polygenic_widget.worker:
+            try:
+                self.polygenic_widget.worker.progress.disconnect(self._on_poly_progress)
+            except:
+                pass
+            self.polygenic_widget.worker.progress.connect(self._on_poly_progress)
+            try:
+                self.polygenic_widget.worker.finished.disconnect(self._on_polygenic_finished)
+            except:
+                pass
+            self.polygenic_widget.worker.finished.connect(self._on_polygenic_finished)
+    
+    def _on_polygenic_finished(self, results) -> None:
+        """Handle polygenic computation completion."""
+        self.poly_progress_bar.setValue(100)
+        self.poly_progress_label.setText(f"📊 ✓ {len(results)} scores computed")
+        self.progress_label.setText("All analyses complete!")
+        
+        # Update status bar with final summary
+        self.status_bar.showMessage(
+            f"✓ {len(self.snp_records):,} SNPs | "
+            f"{len(self.all_matches):,} GWAS matches | "
+            f"{len(results)} polygenic scores"
+        )
+        
+        # Hide progress frame after a short delay
+        QTimer.singleShot(2000, self._hide_progress_if_complete)
+    
+    def _hide_progress_if_complete(self) -> None:
+        """Hide progress frame if all computations are complete."""
+        # Check if all progress bars are at 100%
+        if (self.file_progress_bar.value() == 100 and 
+            self.mono_progress_bar.value() == 100 and
+            self.poly_progress_bar.value() == 100):
+            self.progress_frame.setVisible(False)
     
     def _on_processing_error(self, error_message: str) -> None:
         """Handle processing error."""
@@ -866,6 +1124,12 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait()
+        
+        # Also cancel polygenic worker if running
+        if (hasattr(self.polygenic_widget, 'worker') and 
+            self.polygenic_widget.worker and 
+            self.polygenic_widget.worker.isRunning()):
+            self.polygenic_widget._cancel_computation()
         
         self.progress_frame.setVisible(False)
         self.upload_btn.setEnabled(True)
@@ -1045,4 +1309,12 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait()
+        
+        # Also stop polygenic worker
+        if (hasattr(self.polygenic_widget, 'worker') and 
+            self.polygenic_widget.worker and 
+            self.polygenic_widget.worker.isRunning()):
+            self.polygenic_widget.worker.cancel()
+            self.polygenic_widget.worker.wait()
+        
         event.accept()

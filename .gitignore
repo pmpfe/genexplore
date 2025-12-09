@@ -1,5 +1,9 @@
 logs/*
 *.log
 *__pycache__*
+*.db
 database/backups
-
+database/*.db
+database/downloads/*
+database/gwas.db
+database/pgs.db

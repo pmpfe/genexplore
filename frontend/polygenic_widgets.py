@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QLineEdit, QProgressBar, QFrame, QGroupBox, QSplitter,
-    QDialog, QTextEdit, QScrollArea, QDialogButtonBox,
+    QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox,
     QMessageBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
@@ -36,6 +36,8 @@ class PolygenicComputeWorker(QThread):
     """
     Background worker for computing all polygenic scores.
     
+    Loads score variants incrementally from database to avoid UI freeze.
+    
     Signals:
         progress: (current, total, message) progress updates
         score_computed: (pgs_id, result) individual score completed
@@ -50,35 +52,45 @@ class PolygenicComputeWorker(QThread):
     def __init__(
         self,
         snp_records: List[SNPRecord],
-        scores: List[PolygenicScore],
-        distributions: Dict[str, PopulationDistribution]
+        score_ids: List[str],  # Just IDs, not full scores
+        distributions: Dict[str, PopulationDistribution],
+        db_path: str  # Database path for loading variants in thread
     ) -> None:
         super().__init__()
         self.snp_records = snp_records
-        self.scores = scores
+        self.score_ids = score_ids
         self.distributions = distributions
+        self.db_path = db_path
         self._is_cancelled = False
     
     def run(self) -> None:
         """Execute polygenic score computation."""
         try:
+            # Create database connection in this thread
+            pgs_db = PolygenicDatabase(self.db_path)
+            
             scorer = PolygenicScorer()
             scorer.load_genotypes(self.snp_records)
             
             results = []
-            total = len(self.scores)
+            total = len(self.score_ids)
             
-            for i, score in enumerate(self.scores):
+            for i, pgs_id in enumerate(self.score_ids):
                 if self._is_cancelled:
                     return
                 
-                self.progress.emit(i + 1, total, f"Computing {score.trait_name}...")
+                self.progress.emit(i + 1, total, f"Loading & computing score {i+1}/{total}...")
                 
-                pop_dist = self.distributions.get(score.pgs_id)
+                # Load score with variants in background thread
+                score = pgs_db.get_score_with_variants(pgs_id)
+                if not score:
+                    continue
+                
+                pop_dist = self.distributions.get(pgs_id)
                 result = scorer.compute_score(score, pop_dist)
                 results.append(result)
                 
-                self.score_computed.emit(score.pgs_id, result)
+                self.score_computed.emit(pgs_id, result)
             
             self.finished.emit(results)
             
@@ -290,8 +302,7 @@ class ScoreDetailDialog(QDialog):
         context_layout.setContentsMargins(8, 12, 8, 8)
         context_layout.setSpacing(2)
         
-        context_text = QTextEdit()
-        context_text.setReadOnly(True)
+        context_text = QTextBrowser()
         context_text.setOpenExternalLinks(True)
         context_text.setMinimumHeight(120)
         context_text.setMaximumHeight(150)
@@ -549,27 +560,24 @@ class PolygenicBrowserWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Info banner about sample data
-        info_frame = QFrame()
-        info_frame.setStyleSheet("""
+        # Info banner - dynamic based on database content
+        self.info_frame = QFrame()
+        self.info_frame.setStyleSheet("""
             QFrame { background-color: #e7f3fe; border: 1px solid #2196F3; border-radius: 4px; padding: 5px; }
             QLabel { color: #1565C0; }
         """)
-        info_layout = QHBoxLayout(info_frame)
+        info_layout = QHBoxLayout(self.info_frame)
         info_layout.setContentsMargins(10, 5, 10, 5)
         
         info_icon = QLabel("ℹ️")
         info_layout.addWidget(info_icon)
         
-        info_text = QLabel(
-            "Currently showing sample PGS data. Full PGS Catalog integration (660+ traits) "
-            "coming soon. Check Database Settings for update options."
-        )
-        info_text.setWordWrap(True)
-        info_text.setFont(QFont('Arial', 9))
-        info_layout.addWidget(info_text, stretch=1)
+        self.info_text = QLabel()
+        self.info_text.setWordWrap(True)
+        self.info_text.setFont(QFont('Arial', 9))
+        info_layout.addWidget(self.info_text, stretch=1)
         
-        layout.addWidget(info_frame)
+        layout.addWidget(self.info_frame)
         
         # Status bar
         status_layout = QHBoxLayout()
@@ -679,9 +687,42 @@ class PolygenicBrowserWidget(QWidget):
             self.scores = self.pgs_db.get_all_scores()
             self.distributions = self.pgs_db.get_all_distributions()
             self._update_table()
+            self._update_info_banner()
             logger.info(f"Loaded {len(self.scores)} polygenic scores")
         except Exception as e:
             logger.error(f"Error loading polygenic scores: {e}")
+            self._update_info_banner()
+    
+    def _update_info_banner(self) -> None:
+        """Update the info banner based on database status."""
+        num_scores = len(self.scores)
+        
+        if num_scores == 0:
+            self.info_text.setText(
+                "No PGS scores in database. Run 'python database/update_databases.py --pgs' "
+                "to download from PGS Catalog."
+            )
+            self.info_frame.setStyleSheet("""
+                QFrame { background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 5px; }
+                QLabel { color: #856404; }
+            """)
+        elif num_scores <= 10:
+            self.info_text.setText(
+                f"Using sample data ({num_scores} scores). For full PGS Catalog (660+ traits), "
+                "run 'python database/update_databases.py --pgs' in terminal."
+            )
+            self.info_frame.setStyleSheet("""
+                QFrame { background-color: #e7f3fe; border: 1px solid #2196F3; border-radius: 4px; padding: 5px; }
+                QLabel { color: #1565C0; }
+            """)
+        else:
+            self.info_text.setText(
+                f"Loaded {num_scores} polygenic scores from PGS Catalog."
+            )
+            self.info_frame.setStyleSheet("""
+                QFrame { background-color: #d4edda; border: 1px solid #28a745; border-radius: 4px; padding: 5px; }
+                QLabel { color: #155724; }
+            """)
     
     def set_genotype_data(self, snp_records: List[SNPRecord]) -> None:
         """
@@ -699,21 +740,23 @@ class PolygenicBrowserWidget(QWidget):
         if not self.snp_records:
             return
         
-        # Load full score data with variants
-        full_scores = []
-        for score in self.scores:
-            full_score = self.pgs_db.get_score_with_variants(score.pgs_id)
-            if full_score:
-                full_scores.append(full_score)
+        # Just get score IDs - variants will be loaded in background thread
+        score_ids = [score.pgs_id for score in self.scores]
+        
+        if not score_ids:
+            self.status_label.setText("No scores available to compute")
+            return
         
         self.compute_btn.setEnabled(False)
         self.progress_frame.setVisible(True)
         self.progress_bar.setValue(0)
+        self.progress_label.setText(f"Starting computation of {len(score_ids)} scores...")
         
         self.worker = PolygenicComputeWorker(
             self.snp_records,
-            full_scores,
-            self.distributions
+            score_ids,
+            self.distributions,
+            self.pgs_db.db_path  # Pass db path for thread-safe access
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.score_computed.connect(self._on_score_computed)
@@ -988,26 +1031,32 @@ class DatabaseSettingsWidget(QWidget):
         
         layout.addWidget(backup_group)
         
-        # Actions
-        actions_layout = QHBoxLayout()
-        
-        self.refresh_btn = QPushButton("🔄 Refresh")
-        self.refresh_btn.clicked.connect(self._refresh_versions)
-        actions_layout.addWidget(self.refresh_btn)
-        
-        actions_layout.addStretch()
-        layout.addLayout(actions_layout)
-        
         layout.addStretch()
         
-        # Note
-        note = QLabel(
-            "Note: Database updates require internet connection and are downloaded "
-            "from official sources. A backup is automatically created before any update."
+        # Update instructions
+        update_group = QGroupBox("How to Update")
+        update_layout = QVBoxLayout(update_group)
+        
+        update_text = QLabel(
+            "To download the full PGS Catalog (660+ traits), run:\n\n"
+            "  python database/update_databases.py --pgs\n\n"
+            "This will download all available polygenic scores from the PGS Catalog. "
+            "For testing with limited data:\n\n"
+            "  python database/update_databases.py --pgs --limit 50"
         )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #666; font-style: italic;")
-        layout.addWidget(note)
+        update_text.setWordWrap(True)
+        update_text.setStyleSheet("""
+            QLabel { 
+                background-color: #f8f9fa; 
+                padding: 15px; 
+                border: 1px solid #dee2e6; 
+                border-radius: 4px;
+                font-family: monospace;
+            }
+        """)
+        update_layout.addWidget(update_text)
+        
+        layout.addWidget(update_group)
     
     def _refresh_versions(self) -> None:
         """Refresh version information display."""
