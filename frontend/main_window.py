@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QLineEdit,
     QComboBox, QSlider, QProgressBar, QStatusBar, QMessageBox,
     QHeaderView, QGroupBox, QSpinBox, QFrame, QSplitter, QApplication,
-    QDialog, QTextEdit, QScrollArea, QDialogButtonBox, QTabWidget
+    QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QDesktopServices
@@ -120,21 +120,13 @@ class HelpDialog(QDialog):
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         
-        # Scrollable text area
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        
-        help_text = QTextEdit()
+        help_text = QTextBrowser()
         help_text.setReadOnly(True)
+        help_text.setOpenExternalLinks(True)
         help_text.setHtml(self._get_help_content())
         help_text.setMinimumHeight(500)
         
-        content_layout.addWidget(help_text)
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+        layout.addWidget(help_text)
         
         # Close button
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -145,6 +137,9 @@ class HelpDialog(QDialog):
         return """
         <h1>Genetic Analysis Application</h1>
         
+        <p style="text-align:center"><a href="https://github.com/pmpfe/genexplore">github.com/pmpfe/genexplore</a><br/>
+        Author: <a href="mailto:pferreira@gmail.com">pferreira@gmail.com</a></p>
+
         <h2>What is this program?</h2>
         <p>This application analyzes your raw genetic data from 23andMe and provides two types of analysis:</p>
         <ul>
