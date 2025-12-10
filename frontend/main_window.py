@@ -752,7 +752,7 @@ class MainWindow(QMainWindow):
         pvalue_label = QLabel("Max P-value (log scale):")
         self.pvalue_slider = QSlider(Qt.Orientation.Horizontal)
         self.pvalue_slider.setRange(0, 100)
-        self.pvalue_slider.setValue(100)
+        self.pvalue_slider.setValue(73) # Corresponds to p-value of 5e-8
         self.pvalue_value_label = QLabel("1.0")
         pvalue_group.addWidget(pvalue_label)
         pvalue_group.addWidget(self.pvalue_slider)
