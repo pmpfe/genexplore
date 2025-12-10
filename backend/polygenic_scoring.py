@@ -126,10 +126,16 @@ class PolygenicScorer:
             percentile = population_dist.score_to_percentile(raw_score)
             population_reference = population_dist.population
         else:
-            # Without population data, use raw score and estimate
-            normalized_score = raw_score
-            percentile = 50.0  # Default to median
-            population_reference = "Unknown"
+            # Estimate distribution from variant weights and allele frequencies
+            estimated_dist = self._estimate_population_distribution(pgs)
+            if estimated_dist:
+                normalized_score = self._normalize_score(raw_score, estimated_dist)
+                percentile = estimated_dist.score_to_percentile(raw_score)
+                population_reference = "Estimated"
+            else:
+                normalized_score = raw_score
+                percentile = 50.0
+                population_reference = "Unknown"
         
         # Determine risk category
         risk_category = RiskCategory.from_percentile(percentile)
@@ -243,6 +249,61 @@ class PolygenicScorer:
         if population_dist.std <= 0:
             return 0.0
         return (raw_score - population_dist.mean) / population_dist.std
+    
+    def _estimate_population_distribution(
+        self,
+        pgs: PolygenicScore
+    ) -> Optional[PopulationDistribution]:
+        """
+        Estimate population distribution from variant weights and allele frequencies.
+        
+        Uses the theoretical expectation and variance of polygenic scores under
+        Hardy-Weinberg equilibrium. For each variant with effect weight β and
+        effect allele frequency p, the expected contribution is 2pβ and the
+        variance is 2p(1-p)β².
+        
+        Args:
+            pgs: Polygenic score with variants.
+            
+        Returns:
+            PopulationDistribution with estimated mean and std, or None if cannot estimate.
+        """
+        if not pgs.variants:
+            return None
+        
+        total_mean = 0.0
+        total_variance = 0.0
+        variants_with_freq = 0
+        
+        for variant in pgs.variants:
+            # Use effect allele frequency if available, otherwise assume 0.5
+            p = variant.effect_allele_frequency if variant.effect_allele_frequency else 0.5
+            beta = variant.effect_weight
+            
+            # Expected value: E[score] = 2 * p * β (diploid, two alleles)
+            total_mean += 2 * p * beta
+            
+            # Variance: Var[score] = 2 * p * (1-p) * β² (binomial variance for allele count)
+            total_variance += 2 * p * (1 - p) * beta * beta
+            
+            if variant.effect_allele_frequency:
+                variants_with_freq += 1
+        
+        # Standard deviation
+        total_std = math.sqrt(total_variance) if total_variance > 0 else 0.01
+        
+        # Log coverage of frequency data
+        freq_coverage = variants_with_freq / len(pgs.variants) * 100 if pgs.variants else 0
+        if freq_coverage < 50:
+            logger.debug(f"Low frequency coverage ({freq_coverage:.0f}%) for {pgs.pgs_id}, estimates may be less accurate")
+        
+        return PopulationDistribution(
+            pgs_id=pgs.pgs_id,
+            population="Estimated",
+            mean=total_mean,
+            std=total_std,
+            percentiles={}  # Will use z-score approximation
+        )
     
     def clear_cache(self) -> None:
         """Clear the genotype cache."""

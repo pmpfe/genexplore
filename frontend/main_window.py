@@ -16,9 +16,11 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QDesktopServices
 
 from models.data_models import SNPRecord, GWASMatch, FilterCriteria
+from models.polygenic_models import PolygenicResult
 from backend.parsers import Parser23andMe, ParseError
 from backend.search_engine import SearchEngine, DatabaseError
 from backend.scoring import get_score_interpretation
+from backend.session_manager import SessionManager
 from frontend.polygenic_widgets import (
     PolygenicBrowserWidget, DatabaseSettingsWidget
 )
@@ -564,6 +566,7 @@ class MainWindow(QMainWindow):
         self.current_page = 0
         self.worker: Optional[ProcessingWorker] = None
         self.snp_records: List[SNPRecord] = []
+        self.polygenic_results: List[PolygenicResult] = []
         
         self.search_engine = SearchEngine(DATABASE_PATH)
         
@@ -604,6 +607,22 @@ class MainWindow(QMainWindow):
         self.help_btn.setMinimumHeight(40)
         self.help_btn.setFont(QFont('Arial', 11))
         header_layout.addWidget(self.help_btn)
+        
+        # Save/Load session buttons
+        self.save_btn = QPushButton("💾 Save")
+        self.save_btn.setMinimumWidth(80)
+        self.save_btn.setMinimumHeight(40)
+        self.save_btn.setFont(QFont('Arial', 11))
+        self.save_btn.setEnabled(False)
+        self.save_btn.setToolTip("Save analysis results to file")
+        header_layout.addWidget(self.save_btn)
+        
+        self.load_btn = QPushButton("📂 Load")
+        self.load_btn.setMinimumWidth(80)
+        self.load_btn.setMinimumHeight(40)
+        self.load_btn.setFont(QFont('Arial', 11))
+        self.load_btn.setToolTip("Load previously saved analysis")
+        header_layout.addWidget(self.load_btn)
         
         self.upload_btn = QPushButton("📁 Upload 23andMe File")
         self.upload_btn.setMinimumWidth(200)
@@ -924,6 +943,8 @@ class MainWindow(QMainWindow):
         """Set up signal-slot connections."""
         self.upload_btn.clicked.connect(self._on_upload_clicked)
         self.help_btn.clicked.connect(self._on_help_clicked)
+        self.save_btn.clicked.connect(self._on_save_clicked)
+        self.load_btn.clicked.connect(self._on_load_clicked)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         self.prev_btn.clicked.connect(self._on_prev_page)
         self.next_btn.clicked.connect(self._on_next_page)
@@ -1084,9 +1105,13 @@ class MainWindow(QMainWindow):
     
     def _on_polygenic_finished(self, results) -> None:
         """Handle polygenic computation completion."""
+        self.polygenic_results = results
         self.poly_progress_bar.setValue(100)
         self.poly_progress_label.setText(f"📊 ✓ {len(results)} scores computed")
         self.progress_label.setText("All analyses complete!")
+        
+        # Enable save button now that we have complete results
+        self.save_btn.setEnabled(True)
         
         # Update status bar with final summary
         self.status_bar.showMessage(
@@ -1290,6 +1315,132 @@ class MainWindow(QMainWindow):
         """Show the help dialog."""
         dialog = HelpDialog(self)
         dialog.exec()
+    
+    def _on_save_clicked(self) -> None:
+        """Save current analysis session to file."""
+        if not self.snp_records:
+            QMessageBox.warning(
+                self, "No Data", 
+                "No analysis data to save. Please upload a 23andMe file first."
+            )
+            return
+        
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Analysis Session",
+            "",
+            "GenExplore Session (*.gxs);;All Files (*)"
+        )
+        
+        if not filepath:
+            return
+        
+        # Ensure .gxs extension
+        if not filepath.endswith('.gxs'):
+            filepath += '.gxs'
+        
+        try:
+            self.status_bar.showMessage("Saving session...")
+            QApplication.processEvents()
+            
+            SessionManager.save_session(
+                filepath=filepath,
+                snp_records=self.snp_records,
+                gwas_matches=self.all_matches,
+                polygenic_results=self.polygenic_results,
+                metadata={
+                    "app_version": APP_VERSION,
+                    "snp_file": getattr(self, '_last_loaded_file', None)
+                }
+            )
+            
+            self.status_bar.showMessage(f"Session saved to {filepath}")
+            QMessageBox.information(
+                self, "Session Saved",
+                f"Analysis session saved successfully.\n\n"
+                f"File: {filepath}\n"
+                f"SNPs: {len(self.snp_records):,}\n"
+                f"GWAS matches: {len(self.all_matches):,}\n"
+                f"Polygenic scores: {len(self.polygenic_results)}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to save session: {e}")
+            QMessageBox.critical(
+                self, "Save Error",
+                f"Failed to save session:\n{str(e)}"
+            )
+            self.status_bar.showMessage("Save failed")
+    
+    def _on_load_clicked(self) -> None:
+        """Load a previously saved analysis session."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Analysis Session",
+            "",
+            "GenExplore Session (*.gxs);;All Files (*)"
+        )
+        
+        if not filepath:
+            return
+        
+        try:
+            self.status_bar.showMessage("Loading session...")
+            QApplication.processEvents()
+            
+            snp_records, gwas_matches, polygenic_results, metadata = \
+                SessionManager.load_session(filepath)
+            
+            # Update internal state
+            self.snp_records = snp_records
+            self.all_matches = gwas_matches
+            self.polygenic_results = polygenic_results
+            self.current_page = 0
+            
+            # Update UI
+            self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
+            self.genotype_status.setStyleSheet("color: #006000; font-weight: bold;")
+            
+            # Enable filters and save button
+            self.filters_group.setEnabled(True)
+            self.save_btn.setEnabled(True)
+            
+            # Refresh monogenic results table
+            self._reset_filters()
+            
+            # Update polygenic widget with loaded data
+            self.polygenic_widget.set_genotype_data(snp_records)
+            self.polygenic_widget.display_loaded_results(polygenic_results)
+            
+            # Show summary
+            created_at = metadata.get('created_at', 'Unknown')
+            self.status_bar.showMessage(
+                f"✓ Session loaded | {len(snp_records):,} SNPs | "
+                f"{len(gwas_matches):,} matches | {len(polygenic_results)} scores"
+            )
+            
+            QMessageBox.information(
+                self, "Session Loaded",
+                f"Analysis session loaded successfully.\n\n"
+                f"Created: {created_at}\n"
+                f"SNPs: {len(snp_records):,}\n"
+                f"GWAS matches: {len(gwas_matches):,}\n"
+                f"Polygenic scores: {len(polygenic_results)}"
+            )
+            
+        except ValueError as e:
+            QMessageBox.critical(
+                self, "Invalid File",
+                f"The file is not a valid GenExplore session:\n{str(e)}"
+            )
+            self.status_bar.showMessage("Load failed - invalid file")
+        except Exception as e:
+            logger.error(f"Failed to load session: {e}")
+            QMessageBox.critical(
+                self, "Load Error",
+                f"Failed to load session:\n{str(e)}"
+            )
+            self.status_bar.showMessage("Load failed")
     
     def _on_prev_page(self) -> None:
         """Go to previous page."""

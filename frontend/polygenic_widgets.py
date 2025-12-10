@@ -504,14 +504,17 @@ class ScoreDetailDialog(QDialog):
         
         links_html = " | ".join(links)
         
+        sample_size_str = f"{s.sample_size:,}" if s.sample_size else "N/A"
+        num_variants_str = f"{s.num_variants:,}" if s.num_variants else "N/A"
+        
         return f"""
         <style>td {{ padding: 1px 4px; }} p {{ margin: 3px 0; }}</style>
         <table border="0" style="width: 100%;">
             <tr><td><b>Score ID:</b></td><td>{s.pgs_id}</td></tr>
             <tr><td><b>Year:</b></td><td>{s.publication_year or 'N/A'}</td></tr>
-            <tr><td><b>Population:</b></td><td>{s.study_population}</td></tr>
-            <tr><td><b>Sample Size:</b></td><td>{s.sample_size:,}</td></tr>
-            <tr><td><b>Variants:</b></td><td>{s.num_variants}</td></tr>
+            <tr><td><b>Population:</b></td><td>{s.study_population or 'N/A'}</td></tr>
+            <tr><td><b>Sample Size:</b></td><td>{sample_size_str}</td></tr>
+            <tr><td><b>Variants:</b></td><td>{num_variants_str}</td></tr>
         </table>
         <p><b>Links:</b> {links_html}</p>
         """
@@ -734,6 +737,25 @@ class PolygenicBrowserWidget(QWidget):
         self.snp_records = snp_records
         self.compute_btn.setEnabled(True)
         self.status_label.setText(f"{len(snp_records)} SNPs loaded - Ready to compute scores")
+    
+    def display_loaded_results(self, results: List[PolygenicResult]) -> None:
+        """
+        Display previously loaded/saved polygenic results.
+        
+        Used when loading a saved session to show results without recomputing.
+        
+        Args:
+            results: List of PolygenicResult objects from saved session.
+        """
+        # Store results in dictionary by pgs_id
+        self.results = {r.pgs_id: r for r in results}
+        
+        # Update table to show loaded results
+        self._update_table()
+        
+        # Update status
+        self.status_label.setText(f"Loaded {len(results)} polygenic scores from session")
+        self.compute_btn.setEnabled(True)
     
     def _start_computation(self) -> None:
         """Start computing all polygenic scores."""
