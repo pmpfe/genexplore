@@ -1,6 +1,6 @@
 # GenExplore - Genetic Analysis Desktop Application
 
-A PyQt6-based desktop application for analyzing 23andMe genetic data, featuring both monogenic (single-variant) analysis against the GWAS Catalog and polygenic risk score (PRS) analysis using the PGS Catalog.
+A PyQt6-based desktop application for analyzing 23andMe genetic data, featuring both monogenic (single-variant) analysis against the [GWAS Catalog](https://www.ebi.ac.uk/gwas/) and polygenic risk score (PRS) analysis using the [PGS Catalog](https://www.pgscatalog.org/).
 
 ![App Screenshot](utils/screenshot.png)
 
