@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QLineEdit, QProgressBar, QFrame, QGroupBox, QSplitter,
     QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox,
-    QMessageBox, QSizePolicy
+    QMessageBox, QSizePolicy, QSlider
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush, QDesktopServices
@@ -637,11 +637,31 @@ class PolygenicBrowserWidget(QWidget):
         
         layout.addLayout(filter_layout)
         
+        # Coverage filter slider
+        coverage_layout = QHBoxLayout()
+        coverage_layout.addWidget(QLabel("Min. Coverage:"))
+        
+        self.coverage_slider = QSlider(Qt.Orientation.Horizontal)
+        self.coverage_slider.setRange(0, 100)
+        self.coverage_slider.setValue(0)
+        self.coverage_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.coverage_slider.setTickInterval(10)
+        self.coverage_slider.setMaximumWidth(200)
+        self.coverage_slider.valueChanged.connect(self._on_coverage_changed)
+        coverage_layout.addWidget(self.coverage_slider)
+        
+        self.coverage_label = QLabel("0%")
+        self.coverage_label.setMinimumWidth(40)
+        coverage_layout.addWidget(self.coverage_label)
+        
+        coverage_layout.addStretch()
+        layout.addLayout(coverage_layout)
+        
         # Results table
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
-            "Trait", "Category", "Variants", "Score", "Percentile", "Risk", "Details"
+            "Trait", "Category", "Variants", "Coverage", "Score", "Percentile", "Risk", "Details"
         ])
         
         header = self.table.horizontalHeader()
@@ -652,6 +672,7 @@ class PolygenicBrowserWidget(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
@@ -824,10 +845,16 @@ class PolygenicBrowserWidget(QWidget):
         """Handle search input change with debounce."""
         self._search_timer.start(300)
     
+    def _on_coverage_changed(self, value: int) -> None:
+        """Handle coverage slider change."""
+        self.coverage_label.setText(f"{value}%")
+        self._apply_filters()
+    
     def _apply_filters(self) -> None:
         """Apply current filters to the table."""
         category = self.category_filter.currentText()
         search = self.search_input.text().lower().strip()
+        min_coverage = self.coverage_slider.value()
         
         for row in range(self.table.rowCount()):
             show = True
@@ -843,6 +870,18 @@ class PolygenicBrowserWidget(QWidget):
                 trait = self.table.item(row, 0)
                 if trait and search not in trait.text().lower():
                     show = False
+            
+            # Coverage filter
+            if min_coverage > 0 and show:
+                coverage_item = self.table.item(row, 3)
+                if coverage_item:
+                    try:
+                        coverage_val = float(coverage_item.text().replace('%', ''))
+                        if coverage_val < min_coverage:
+                            show = False
+                    except ValueError:
+                        # Coverage not computed yet (shows "-")
+                        show = False
             
             self.table.setRowHidden(row, not show)
     
@@ -892,15 +931,26 @@ class PolygenicBrowserWidget(QWidget):
         self.table.setItem(row, 2, var_item)
         
         if result:
+            # Coverage
+            coverage_item = QTableWidgetItem(f"{result.coverage_percent:.1f}%")
+            coverage_item.setFlags(coverage_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if result.coverage_percent >= 80:
+                coverage_item.setForeground(QColor(0, 100, 0))
+            elif result.coverage_percent >= 50:
+                coverage_item.setForeground(QColor(128, 100, 0))
+            else:
+                coverage_item.setForeground(QColor(180, 0, 0))
+            self.table.setItem(row, 3, coverage_item)
+            
             # Score
             score_item = QTableWidgetItem(f"{result.raw_score:.3f}")
             score_item.setFlags(score_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table.setItem(row, 3, score_item)
+            self.table.setItem(row, 4, score_item)
             
             # Percentile
             pct_item = QTableWidgetItem(f"{result.percentile:.0f}%")
             pct_item.setFlags(pct_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table.setItem(row, 4, pct_item)
+            self.table.setItem(row, 5, pct_item)
             
             # Risk category with color
             risk_item = QTableWidgetItem(result.risk_category.value)
@@ -915,7 +965,7 @@ class PolygenicBrowserWidget(QWidget):
             else:
                 risk_item.setBackground(QColor(255, 255, 200))
             
-            self.table.setItem(row, 5, risk_item)
+            self.table.setItem(row, 6, risk_item)
             
             # Details button
             details_btn = QPushButton("📊 View")
@@ -934,16 +984,16 @@ class PolygenicBrowserWidget(QWidget):
             details_btn.clicked.connect(
                 lambda checked, pid=score.pgs_id: self._show_details(pid)
             )
-            self.table.setCellWidget(row, 6, details_btn)
+            self.table.setCellWidget(row, 7, details_btn)
         else:
             # Not computed yet
-            for col in range(3, 6):
+            for col in range(3, 7):
                 item = QTableWidgetItem("-")
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setForeground(QColor(150, 150, 150))
                 self.table.setItem(row, col, item)
             
-            self.table.setCellWidget(row, 6, None)
+            self.table.setCellWidget(row, 7, None)
     
     def _show_details(self, pgs_id: str) -> None:
         """Show detailed view for a score."""
