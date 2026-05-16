@@ -4,6 +4,4 @@ logs/*
 *.db
 database/backups
 database/downloads/*
-database/gwas.db
-database/pgs.db
-database/gwas.db
+database/*.db
