@@ -7,16 +7,20 @@ Contains widgets for:
 - Database management settings
 """
 
+import sys
+from pathlib import Path
 from typing import List, Optional, Dict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QLineEdit, QProgressBar, QFrame, QGroupBox, QSplitter,
     QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox,
-    QMessageBox, QSizePolicy, QSlider
+    QMessageBox, QSizePolicy, QSlider, QPlainTextEdit, QFormLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QProcess
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush, QDesktopServices
+import gc
+import re
 
 from models.polygenic_models import (
     PolygenicScore, PolygenicResult, PopulationDistribution,
@@ -27,9 +31,39 @@ from backend.polygenic_scoring import PolygenicScorer, get_risk_interpretation, 
 from database.polygenic_database import (
     PolygenicDatabase, DatabaseVersionManager, get_gwas_database_stats
 )
+from config import BASE_DIR
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _coverage_confidence_label(coverage_percent: float) -> tuple[str, str, str]:
+    """
+    Return a (label, color_hex, explanation) tuple for a coverage percentage.
+    """
+    if coverage_percent >= 80:
+        return (
+            "High",
+            "#c8e6c9",  # light green background
+            "High coverage (>=80%): Results are based on most variants in this score and are more reliable."
+        )
+    if coverage_percent >= 50:
+        return (
+            "Moderate",
+            "#fff3cd",  # light amber
+            "Moderate coverage (50–79%): Useful but interpret with caution; some variants are missing."
+        )
+    if coverage_percent >= 20:
+        return (
+            "Low",
+            "#ffe0b2",  # light orange
+            "Low coverage (20–49%): Limited reliability; consider reprocessing with denser data or imputation."
+        )
+    return (
+        "Very low",
+        "#f8d7da",  # light red
+        "Very low coverage (<20%): Not informative for clinical interpretation. Consider using WGS/VCF or imputation."
+    )
 
 
 class PolygenicComputeWorker(QThread):
@@ -71,7 +105,15 @@ class PolygenicComputeWorker(QThread):
             
             scorer = PolygenicScorer()
             scorer.load_genotypes(self.snp_records)
-            
+            # Release worker's reference to the full SNP list to reduce peak
+            # memory usage. The main thread retains its own reference.
+            try:
+                self.snp_records = []
+                del self.snp_records
+            except Exception:
+                pass
+            gc.collect()
+
             results = []
             total = len(self.score_ids)
             
@@ -265,12 +307,41 @@ class ScoreDetailDialog(QDialog):
         results_layout.setContentsMargins(8, 12, 8, 8)
         results_layout.setSpacing(4)
         
-        results_text = QTextEdit()
-        results_text.setReadOnly(True)
-        results_text.setMinimumHeight(150)
-        results_text.setMaximumHeight(180)
-        results_text.setHtml(self._get_results_html())
-        results_layout.addWidget(results_text)
+        # Results shown as individual labeled fields with tooltips
+        results_form = QFormLayout()
+        results_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        pct_label = QLabel(f"{self.result.percentile:.1f}th")
+        pct_label.setToolTip("Percentile: estimated position in the reference population (0–100). Higher percentiles indicate greater genetic predisposition for the trait.")
+        results_form.addRow(QLabel("<b>Percentile:</b>"), pct_label)
+
+        risk_color = {
+            RiskCategory.LOW: "#006000",
+            RiskCategory.INTERMEDIATE: "#806000",
+            RiskCategory.HIGH: "#b00000"
+        }.get(self.result.risk_category, "#000000")
+        risk_label = QLabel(self.result.risk_category.value)
+        risk_label.setStyleSheet(f"color: {risk_color}; font-weight: bold;")
+        risk_label.setToolTip("Risk category: classification based on percentile thresholds (Low/Intermediate/High).")
+        results_form.addRow(QLabel("<b>Risk Category:</b>"), risk_label)
+
+        raw_label = QLabel(f"{self.result.raw_score:.4f}")
+        raw_label.setToolTip("Raw score: weighted sum of variant contributions for this individual.")
+        results_form.addRow(QLabel("<b>Raw Score:</b>"), raw_label)
+
+        z_label = QLabel(f"{self.result.normalized_score:.2f}")
+        z_label.setToolTip("Z-score: raw score normalized to the reference population (z = (raw - mean)/sd).")
+        results_form.addRow(QLabel("<b>Z-Score:</b>"), z_label)
+
+        pop_label = QLabel(self.result.population_reference)
+        pop_label.setToolTip("Reference population used for normalization/interpolation.")
+        results_form.addRow(QLabel("<b>Population:</b>"), pop_label)
+
+        results_widget = QWidget()
+        results_widget.setLayout(results_form)
+        results_widget.setMinimumHeight(150)
+        results_widget.setMaximumHeight(180)
+        results_layout.addWidget(results_widget)
         row1_layout.addWidget(results_group, stretch=1)
         
         # Population Distribution group (right)
@@ -302,12 +373,46 @@ class ScoreDetailDialog(QDialog):
         context_layout.setContentsMargins(8, 12, 8, 8)
         context_layout.setSpacing(2)
         
-        context_text = QTextBrowser()
-        context_text.setOpenExternalLinks(True)
-        context_text.setMinimumHeight(120)
-        context_text.setMaximumHeight(150)
-        context_text.setHtml(self._get_context_html())
-        context_layout.addWidget(context_text)
+        # Scientific context shown as labeled fields with tooltips
+        context_form = QFormLayout()
+
+        id_label = QLabel(self.score.pgs_id)
+        id_label.setToolTip("PGS identifier in the PGS Catalog.")
+        context_form.addRow(QLabel("<b>Score ID:</b>"), id_label)
+
+        year_label = QLabel(str(self.score.publication_year or 'N/A'))
+        year_label.setToolTip("Year of publication/source for this PGS.")
+        context_form.addRow(QLabel("<b>Year:</b>"), year_label)
+
+        study_pop_label = QLabel(self.score.study_population or 'N/A')
+        study_pop_label.setToolTip("Population used to develop the score (may affect transferability).")
+        context_form.addRow(QLabel("<b>Population:</b>"), study_pop_label)
+
+        sample_size_label = QLabel(f"{self.score.sample_size:,}" if self.score.sample_size else 'N/A')
+        sample_size_label.setToolTip("Sample size of the discovery study used to derive the PGS.")
+        context_form.addRow(QLabel("<b>Sample Size:</b>"), sample_size_label)
+
+        num_variants_label = QLabel(f"{self.score.num_variants:,}")
+        num_variants_label.setToolTip("Total number of variants in the score definition.")
+        context_form.addRow(QLabel("<b>Variants:</b>"), num_variants_label)
+
+        links_label = QLabel()
+        links_html = []
+        if self.score.publication_doi:
+            links_html.append(f'<a href="https://doi.org/{self.score.publication_doi}">DOI</a>')
+        links_html.append(f'<a href="https://www.pgscatalog.org/score/{self.score.pgs_id}/">PGS Catalog</a>')
+        trait_search = self.score.trait_name.replace(' ', '+')
+        links_html.append(f'<a href="https://pubmed.ncbi.nlm.nih.gov/?term={trait_search}+polygenic">PubMed</a>')
+        links_label.setText(' | '.join(links_html))
+        links_label.setOpenExternalLinks(True)
+        links_label.setToolTip('Links to external resources for this score (DOI, PGS Catalog, PubMed).')
+        context_form.addRow(QLabel("<b>Links:</b>"), links_label)
+
+        context_widget = QWidget()
+        context_widget.setLayout(context_form)
+        context_widget.setMinimumHeight(120)
+        context_widget.setMaximumHeight(150)
+        context_layout.addWidget(context_widget)
         row2_layout.addWidget(context_group, stretch=1)
         
         # Quality information (right)
@@ -316,12 +421,32 @@ class ScoreDetailDialog(QDialog):
         quality_layout.setContentsMargins(8, 12, 8, 8)
         quality_layout.setSpacing(2)
         
-        quality_text = QTextEdit()
-        quality_text.setReadOnly(True)
-        quality_text.setMinimumHeight(120)
-        quality_text.setMaximumHeight(150)
-        quality_text.setHtml(self._get_quality_html())
-        quality_layout.addWidget(quality_text)
+        # Quality information shown with per-field tooltips
+        quality_form = QFormLayout()
+
+        cov_label = QLabel(f"{self.result.coverage_percent:.0f}%")
+        cov_label.setToolTip(
+            "Coverage = percentage of variants in the PGS that were found in your genotype file (variants_found / variants_total). Low coverage reduces reliability."
+        )
+        quality_form.addRow(QLabel("<b>Coverage:</b>"), cov_label)
+
+        found_label = QLabel(f"{self.result.variants_found:,}")
+        found_label.setToolTip("Number of variants from this PGS that were matched in your genotype file.")
+        quality_form.addRow(QLabel("<b>Variants Found:</b>"), found_label)
+
+        total_label = QLabel(f"{self.result.variants_total:,}")
+        total_label.setToolTip("Total number of variants defined for this PGS.")
+        quality_form.addRow(QLabel("<b>Variants Total:</b>"), total_label)
+
+        warning_label = QLabel("Yes" if self.result.is_low_coverage() else "No")
+        warning_label.setToolTip("Indicates whether coverage is below the recommended threshold (80%).")
+        quality_form.addRow(QLabel("<b>Low Coverage Warning:</b>"), warning_label)
+
+        quality_widget = QWidget()
+        quality_widget.setLayout(quality_form)
+        quality_widget.setMinimumHeight(120)
+        quality_widget.setMaximumHeight(150)
+        quality_layout.addWidget(quality_widget)
         row2_layout.addWidget(quality_group, stretch=1)
         
         content_layout.addLayout(row2_layout)
@@ -347,6 +472,13 @@ class ScoreDetailDialog(QDialog):
             
             top_contribs = self.result.get_top_contributors(15)
             contrib_table.setRowCount(len(top_contribs))
+
+            # Add header tooltips explaining each column
+            headers = ["Variant (rsID)", "Absolute contribution to score", "Direction of effect", "Quick gene lookup", "External resources"]
+            for hi in range(contrib_table.columnCount()):
+                hi_item = contrib_table.horizontalHeaderItem(hi)
+                if hi_item:
+                    hi_item.setToolTip(headers[hi])
             
             for row, (rsid, contrib) in enumerate(top_contribs):
                 # Variant ID
@@ -535,7 +667,7 @@ class ScoreDetailDialog(QDialog):
         <style>td {{ padding: 1px 4px; }}</style>
         <table border="0" style="width: 100%;">
             <tr><td><b>Variants Found:</b></td><td>{r.variants_found} / {r.variants_total}</td></tr>
-            <tr><td><b>Coverage:</b></td><td><span style="color: {coverage_color}; font-weight: bold;">{r.coverage_percent:.1f}%</span></td></tr>
+            <tr><td><b>Coverage:</b></td><td><span style="color: {coverage_color}; font-weight: bold;">{r.coverage_percent:.0f}%</span></td></tr>
         </table>
         {warning}{pop_warning}
         """
@@ -550,6 +682,7 @@ class PolygenicBrowserWidget(QWidget):
         super().__init__(parent)
         
         self.pgs_db = PolygenicDatabase()
+        self.version_manager = DatabaseVersionManager()
         self.scores: List[PolygenicScore] = []
         self.results: Dict[str, PolygenicResult] = {}
         self.distributions: Dict[str, PopulationDistribution] = {}
@@ -661,7 +794,7 @@ class PolygenicBrowserWidget(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
-            "Trait", "Category", "Variants", "Coverage", "Score", "Percentile", "Risk", "Details"
+            "Trait", "Category", "Variants", "Cover%", "Score", "Percentile", "Risk", "Details"
         ])
         
         header = self.table.horizontalHeader()
@@ -720,20 +853,22 @@ class PolygenicBrowserWidget(QWidget):
     def _update_info_banner(self) -> None:
         """Update the info banner based on database status."""
         num_scores = len(self.scores)
+        is_sample_db = self.version_manager.pgs_db.is_sample_pgs_database()
         
         if num_scores == 0:
             self.info_text.setText(
-                "No PGS scores in database. Run 'python database/update_databases.py --pgs' "
-                "to download from PGS Catalog."
+                "No PGS scores are available. The app ships with example scores only when the bundled "
+                "database is present; otherwise run 'python database/update_databases.py --pgs' "
+                "from the update tab or terminal to download the real PGS Catalog."
             )
             self.info_frame.setStyleSheet("""
                 QFrame { background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 5px; }
                 QLabel { color: #856404; }
             """)
-        elif num_scores <= 10:
+        elif is_sample_db:
             self.info_text.setText(
-                f"Using sample data ({num_scores} scores). For full PGS Catalog (660+ traits), "
-                "run 'python database/update_databases.py --pgs' in terminal."
+                f"Using the bundled example scores ({num_scores} scores). "
+                "Run 'python database/update_databases.py --pgs' to download the real PGS Catalog."
             )
             self.info_frame.setStyleSheet("""
                 QFrame { background-color: #e7f3fe; border: 1px solid #2196F3; border-radius: 4px; padding: 5px; }
@@ -741,7 +876,7 @@ class PolygenicBrowserWidget(QWidget):
             """)
         else:
             self.info_text.setText(
-                f"Loaded {num_scores} polygenic scores from PGS Catalog."
+                f"Loaded {num_scores} polygenic scores from the PGS Catalog database."
             )
             self.info_frame.setStyleSheet("""
                 QFrame { background-color: #d4edda; border: 1px solid #28a745; border-radius: 4px; padding: 5px; }
@@ -777,6 +912,8 @@ class PolygenicBrowserWidget(QWidget):
         # Update status
         self.status_label.setText(f"Loaded {len(results)} polygenic scores from session")
         self.compute_btn.setEnabled(True)
+        # Re-apply any active filters (e.g., coverage slider) after loading
+        self._apply_filters()
     
     def _start_computation(self) -> None:
         """Start computing all polygenic scores."""
@@ -848,6 +985,7 @@ class PolygenicBrowserWidget(QWidget):
     def _on_coverage_changed(self, value: int) -> None:
         """Handle coverage slider change."""
         self.coverage_label.setText(f"{value}%")
+        logger.debug("Coverage slider changed: %s", value)
         self._apply_filters()
     
     def _apply_filters(self) -> None:
@@ -870,17 +1008,51 @@ class PolygenicBrowserWidget(QWidget):
                 trait = self.table.item(row, 0)
                 if trait and search not in trait.text().lower():
                     show = False
-            
-            # Coverage filter
+
+            # Coverage filter - apply regardless of search presence
             if min_coverage > 0 and show:
                 coverage_item = self.table.item(row, 3)
+                coverage_val = None
+
                 if coverage_item:
+                    # Try EditRole first - handle QVariant-like values robustly
                     try:
-                        coverage_val = float(coverage_item.text().replace('%', ''))
-                        if coverage_val < min_coverage:
-                            show = False
-                    except ValueError:
-                        # Coverage not computed yet (shows "-")
+                        v = coverage_item.data(Qt.ItemDataRole.EditRole)
+                    except Exception:
+                        v = None
+
+                    if v is not None:
+                        try:
+                            # v may be int/float or a QVariant-like object
+                            if isinstance(v, (int, float)):
+                                coverage_val = float(v)
+                            else:
+                                coverage_val = float(str(v))
+                        except Exception:
+                            coverage_val = None
+
+                        # Some code may store fractions (0..1); convert to percentage
+                        if coverage_val is not None and 0 <= coverage_val <= 1:
+                            coverage_val = coverage_val * 100.0
+
+                        # Treat negative placeholders as missing
+                        if coverage_val is not None and coverage_val < 0:
+                            coverage_val = None
+
+                    # Fallback: parse displayed text like '12% (Moderate)'
+                    if coverage_val is None:
+                        try:
+                            m = re.search(r'([0-9]+(?:\.[0-9]+)?)%', coverage_item.text())
+                            if m:
+                                coverage_val = float(m.group(1))
+                        except Exception:
+                            coverage_val = None
+
+                if coverage_val is None:
+                    # Coverage not computed yet or malformed -> hide when filtering
+                    show = False
+                else:
+                    if coverage_val < float(min_coverage):
                         show = False
             
             self.table.setRowHidden(row, not show)
@@ -925,36 +1097,57 @@ class PolygenicBrowserWidget(QWidget):
         cat_item.setFlags(cat_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, 1, cat_item)
         
-        # Variants
+        # Variants (show found/total when available)
         var_item = QTableWidgetItem(str(score.num_variants))
         var_item.setFlags(var_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        # Provide a numeric sort key (total variants) for column sorting
+        var_item.setData(Qt.ItemDataRole.EditRole, int(score.num_variants or 0))
         self.table.setItem(row, 2, var_item)
         
         if result:
-            # Coverage
-            coverage_item = QTableWidgetItem(f"{result.coverage_percent:.1f}%")
+            # Variants found/total (display) and numeric sort key (found)
+            var_item.setText(f"{result.variants_found}/{result.variants_total}")
+            var_item.setToolTip(
+                f"Variants matched in genotype: {result.variants_found} of {result.variants_total}."
+            )
+            var_item.setData(Qt.ItemDataRole.EditRole, int(result.variants_found))
+
+            # Coverage with badge label and tooltip
+            label, color_hex, explanation = _coverage_confidence_label(result.coverage_percent)
+            coverage_text = f"{result.coverage_percent:.0f}% ({label})"
+            coverage_item = QTableWidgetItem(coverage_text)
             coverage_item.setFlags(coverage_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if result.coverage_percent >= 80:
-                coverage_item.setForeground(QColor(0, 100, 0))
-            elif result.coverage_percent >= 50:
-                coverage_item.setForeground(QColor(128, 100, 0))
-            else:
-                coverage_item.setForeground(QColor(180, 0, 0))
+            # Numeric value for sorting
+            coverage_item.setData(Qt.ItemDataRole.EditRole, float(result.coverage_percent))
+            # Set background color for badge feel
+            coverage_item.setBackground(QColor(color_hex))
+            coverage_item.setToolTip(
+                f"Coverage: {result.variants_found}/{result.variants_total} = {result.coverage_percent:.0f}%\n\n{explanation}"
+            )
             self.table.setItem(row, 3, coverage_item)
             
             # Score
             score_item = QTableWidgetItem(f"{result.raw_score:.3f}")
             score_item.setFlags(score_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            score_item.setData(Qt.ItemDataRole.EditRole, float(result.raw_score))
             self.table.setItem(row, 4, score_item)
             
             # Percentile
             pct_item = QTableWidgetItem(f"{result.percentile:.0f}%")
             pct_item.setFlags(pct_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            pct_item.setData(Qt.ItemDataRole.EditRole, float(result.percentile))
             self.table.setItem(row, 5, pct_item)
             
             # Risk category with color
             risk_item = QTableWidgetItem(result.risk_category.value)
             risk_item.setFlags(risk_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            # Provide numeric ranking for risk categories to enable proper sorting
+            risk_rank_map = {
+                RiskCategory.HIGH: 3,
+                RiskCategory.INTERMEDIATE: 2,
+                RiskCategory.LOW: 1,
+            }
+            risk_item.setData(Qt.ItemDataRole.EditRole, int(risk_rank_map.get(result.risk_category, 0)))
             
             if result.risk_category == RiskCategory.HIGH:
                 risk_item.setBackground(QColor(255, 200, 200))
@@ -991,6 +1184,8 @@ class PolygenicBrowserWidget(QWidget):
                 item = QTableWidgetItem("-")
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setForeground(QColor(150, 150, 150))
+                # Provide a numeric placeholder so sorting remains stable
+                item.setData(Qt.ItemDataRole.EditRole, -1)
                 self.table.setItem(row, col, item)
             
             self.table.setCellWidget(row, 7, None)
@@ -1024,6 +1219,8 @@ class DatabaseSettingsWidget(QWidget):
         super().__init__(parent)
         
         self.version_manager = DatabaseVersionManager()
+        self.update_process: Optional[QProcess] = None
+        self.update_output: Optional[QPlainTextEdit] = None
         self._init_ui()
         self._refresh_versions()
     
@@ -1066,14 +1263,10 @@ class DatabaseSettingsWidget(QWidget):
         self.pgs_count_label = QLabel("Scores: Loading...")
         pgs_layout.addWidget(self.pgs_count_label)
         
-        # Note about sample data
-        pgs_note = QLabel(
-            "ℹ️ Currently using sample data with 8 example scores. "
-            "Full PGS Catalog integration (660+ traits, thousands of scores) coming in future update."
-        )
-        pgs_note.setWordWrap(True)
-        pgs_note.setStyleSheet("color: #1565C0; background-color: #e7f3fe; padding: 8px; border-radius: 4px;")
-        pgs_layout.addWidget(pgs_note)
+        self.pgs_note_label = QLabel()
+        self.pgs_note_label.setWordWrap(True)
+        self.pgs_note_label.setStyleSheet("color: #1565C0; background-color: #e7f3fe; padding: 8px; border-radius: 4px;")
+        pgs_layout.addWidget(self.pgs_note_label)
         
         pgs_link_layout = QHBoxLayout()
         pgs_link = QPushButton("🔗 Visit PGS Catalog")
@@ -1110,25 +1303,122 @@ class DatabaseSettingsWidget(QWidget):
         update_layout = QVBoxLayout(update_group)
         
         update_text = QLabel(
-            "To download the full PGS Catalog (660+ traits), run:\n\n"
-            "  python database/update_databases.py --pgs\n\n"
-            "This will download all available polygenic scores from the PGS Catalog. "
-            "For testing with limited data:\n\n"
-            "  python database/update_databases.py --pgs --limit 50"
+            "Use the buttons below to run database updates from inside the app. "
+            "The output area will stream the updater logs while the process is running."
         )
         update_text.setWordWrap(True)
-        update_text.setStyleSheet("""
-            QLabel { 
-                background-color: #f8f9fa; 
-                padding: 15px; 
-                border: 1px solid #dee2e6; 
-                border-radius: 4px;
-                font-family: monospace;
-            }
-        """)
         update_layout.addWidget(update_text)
+
+        update_button_layout = QHBoxLayout()
+        self.gwas_update_btn = QPushButton("🔄 Update GWAS")
+        self.gwas_update_btn.clicked.connect(lambda: self._start_database_update("gwas"))
+        update_button_layout.addWidget(self.gwas_update_btn)
+
+        self.pgs_update_btn = QPushButton("🔄 Update PGS")
+        self.pgs_update_btn.clicked.connect(lambda: self._start_database_update("pgs"))
+        update_button_layout.addWidget(self.pgs_update_btn)
+
+        update_button_layout.addStretch()
+        update_layout.addLayout(update_button_layout)
+
+        self.update_output = QPlainTextEdit()
+        self.update_output.setReadOnly(True)
+        self.update_output.setMinimumHeight(180)
+        self.update_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.update_output.setFont(QFont("Monospace"))
+        self._reset_update_output()
+        update_layout.addWidget(self.update_output)
         
         layout.addWidget(update_group)
+
+    def _reset_update_output(self) -> None:
+        """Populate the update panel with current instructions."""
+        if not self.update_output:
+            return
+
+        self.update_output.setPlainText(
+            "Update commands:\n"
+            "  python database/update_databases.py --gwas\n"
+            "  python database/update_databases.py --pgs\n"
+            "  python database/update_databases.py --pgs --limit 50\n\n"
+            "Live output from the last update appears below when you press a button."
+        )
+
+    def _set_update_buttons_enabled(self, enabled: bool) -> None:
+        """Enable or disable the update buttons while a process is running."""
+        self.gwas_update_btn.setEnabled(enabled)
+        self.pgs_update_btn.setEnabled(enabled)
+
+    def _append_update_output(self, text: str) -> None:
+        """Append text to the update console."""
+        if not self.update_output or not text:
+            return
+
+        self.update_output.appendPlainText(text.rstrip('\n'))
+
+    def _start_database_update(self, command: str, limit: Optional[int] = None) -> None:
+        """Run the database updater script in a background process."""
+        if self.update_process and self.update_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Update in progress", "A database update is already running.")
+            return
+
+        script_path = Path(BASE_DIR) / "database" / "update_databases.py"
+        if not script_path.exists():
+            QMessageBox.warning(self, "Updater not found", f"Could not locate {script_path}")
+            return
+
+        args = [str(script_path), f"--{command}"]
+        if limit is not None:
+            args.extend(["--limit", str(limit)])
+
+        self.update_process = QProcess(self)
+        self.update_process.setWorkingDirectory(str(BASE_DIR))
+        self.update_process.readyReadStandardOutput.connect(self._on_update_stdout)
+        self.update_process.readyReadStandardError.connect(self._on_update_stderr)
+        self.update_process.finished.connect(self._on_update_finished)
+
+        self._set_update_buttons_enabled(False)
+        if self.update_output:
+            self.update_output.appendPlainText("")
+            self.update_output.appendPlainText("=" * 72)
+            self.update_output.appendPlainText(f"Starting update: python database/update_databases.py --{command}")
+            if limit is not None:
+                self.update_output.appendPlainText(f"Limit: {limit}")
+            self.update_output.appendPlainText("=" * 72)
+
+        self.update_process.start(sys.executable, args)
+
+    def _on_update_stdout(self) -> None:
+        """Forward updater stdout to the live output console."""
+        if not self.update_process or not self.update_output:
+            return
+
+        data = bytes(self.update_process.readAllStandardOutput()).decode('utf-8', errors='replace')
+        if data:
+            self._append_update_output(data)
+
+    def _on_update_stderr(self) -> None:
+        """Forward updater stderr to the live output console."""
+        if not self.update_process or not self.update_output:
+            return
+
+        data = bytes(self.update_process.readAllStandardError()).decode('utf-8', errors='replace')
+        if data:
+            self._append_update_output(data)
+
+    def _on_update_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        """Finalize the update run and refresh version labels."""
+        if self.update_output:
+            if exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0:
+                self.update_output.appendPlainText("")
+                self.update_output.appendPlainText("Update completed successfully.")
+            else:
+                self.update_output.appendPlainText("")
+                self.update_output.appendPlainText(f"Update finished with exit code {exit_code}.")
+
+        self._set_update_buttons_enabled(True)
+        self._refresh_versions()
+        self.update_process = None
     
     def _refresh_versions(self) -> None:
         """Refresh version information display."""
@@ -1153,11 +1443,28 @@ class DatabaseSettingsWidget(QWidget):
                 f"Last Updated: {pgs_version.download_date.strftime('%Y-%m-%d %H:%M')}"
             )
             pgs_db = PolygenicDatabase()
-            self.pgs_count_label.setText(f"Scores: {pgs_db.get_score_count()}")
+            pgs_count = pgs_db.get_score_count()
+            self.pgs_count_label.setText(f"Scores: {pgs_count}")
+
+            if pgs_db.is_sample_pgs_database():
+                self.pgs_note_label.setText(
+                    "ℹ️ The database currently contains the bundled example scores that ship with the app. "
+                    "Use the update button to download the full PGS Catalog."
+                )
+                self.pgs_note_label.setStyleSheet("color: #1565C0; background-color: #e7f3fe; padding: 8px; border-radius: 4px;")
+            else:
+                self.pgs_note_label.setText(
+                    f"ℹ️ The database currently contains {pgs_count:,} scores from the PGS Catalog."
+                )
+                self.pgs_note_label.setStyleSheet("color: #155724; background-color: #d4edda; padding: 8px; border-radius: 4px;")
         else:
             self.pgs_version_label.setText("Version: Not installed")
             self.pgs_date_label.setText("Last Updated: N/A")
             self.pgs_count_label.setText("Scores: 0")
+            self.pgs_note_label.setText(
+                "ℹ️ No PGS database is installed yet. The app ships with example scores only when the bundled database is present."
+            )
+            self.pgs_note_label.setStyleSheet("color: #856404; background-color: #fff3cd; padding: 8px; border-radius: 4px;")
         
         # Backups
         backups = self.version_manager.list_backups()

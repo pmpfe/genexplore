@@ -135,9 +135,26 @@ class PolygenicDatabase:
                     download_date TEXT NOT NULL,
                     source_url TEXT,
                     record_count INTEGER,
-                    checksum TEXT
+                    checksum TEXT,
+                    source_type TEXT
                 )
             """)
+
+            cursor.execute("PRAGMA table_info(database_versions)")
+            existing_version_columns = {row[1] for row in cursor.fetchall()}
+            if 'source_type' not in existing_version_columns:
+                cursor.execute("ALTER TABLE database_versions ADD COLUMN source_type TEXT")
+
+            cursor.execute(
+                """
+                UPDATE database_versions
+                SET source_type = 'sample'
+                WHERE database_name = 'pgs_catalog'
+                  AND source_type IS NULL
+                  AND version = '1.0.0'
+                  AND COALESCE(record_count, 0) <= 10
+                """
+            )
             
             # Create indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pgs_trait ON polygenic_scores(trait_name)")
@@ -145,6 +162,12 @@ class PolygenicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_variant_rsid ON pgs_variants(rsid)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_variant_pgs ON pgs_variants(pgs_id)")
             
+            cursor.execute("PRAGMA table_info(pgs_variants)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            for column_name in ['dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight']:
+                if column_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE pgs_variants ADD COLUMN {column_name} REAL")
+
             conn.commit()
         
         # Insert sample data if database is empty
@@ -160,7 +183,12 @@ class PolygenicDatabase:
         
         # Insert sample polygenic scores
         self._insert_sample_scores()
-        self._set_version("pgs_catalog", "1.0.0", "https://www.pgscatalog.org/")
+        self._set_version(
+            "pgs_catalog",
+            "1.0.0",
+            "https://www.pgscatalog.org/",
+            source_type="sample"
+        )
     
     def _insert_sample_scores(self) -> None:
         """Insert sample polygenic scores for testing."""
@@ -460,12 +488,15 @@ class PolygenicDatabase:
                 cursor.execute("""
                     INSERT OR REPLACE INTO pgs_variants
                     (pgs_id, rsid, chromosome, position, effect_allele, other_allele,
-                     effect_weight, effect_allele_frequency)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     effect_weight, effect_allele_frequency, dosage_0_weight, dosage_1_weight, dosage_2_weight)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     score.pgs_id, variant.rsid, variant.chromosome, variant.position,
                     variant.effect_allele, variant.other_allele, variant.effect_weight,
-                    variant.effect_allele_frequency
+                    variant.effect_allele_frequency,
+                    variant.dosage_0_weight,
+                    variant.dosage_1_weight,
+                    variant.dosage_2_weight,
                 ))
             
             # Insert distribution if provided
@@ -493,21 +524,39 @@ class PolygenicDatabase:
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # Use columns that exist in the actual database schema
-            # Map 'ancestry' to 'study_population', use publication_title as description
             cursor.execute("""
-                SELECT pgs_id, trait_name, trait_category, publication_doi,
-                       publication_year, ancestry, sample_size, num_variants, publication_title
-                FROM polygenic_scores
-                WHERE download_status = 'complete'
+              SELECT pgs_id, trait_name, trait_category, publication_doi,
+                  publication_year, study_population, sample_size, num_variants, description
+              FROM polygenic_scores
                 ORDER BY trait_name
             """)
             
             for row in cursor.fetchall():
-                try:
-                    category = TraitCategory(row['trait_category']) if row['trait_category'] else TraitCategory.OTHER
-                except ValueError:
-                    category = TraitCategory.OTHER
+                # Map stored trait_category text to TraitCategory enum robustly.
+                raw_cat = row['trait_category'] or ''
+                def _map_category(value: str) -> TraitCategory:
+                    v = (value or '').strip().lower()
+                    if not v:
+                        return TraitCategory.OTHER
+                    if 'metabolic' in v or 'metab' in v:
+                        return TraitCategory.METABOLIC
+                    if 'cardio' in v or 'cardiovascular' in v:
+                        return TraitCategory.CARDIOVASCULAR
+                    if 'neuro' in v or 'psychiatr' in v:
+                        return TraitCategory.NEUROPSYCHIATRIC
+                    if 'oncolog' in v or 'cancer' in v or 'tumor' in v:
+                        return TraitCategory.ONCOLOGY
+                    if 'immune' in v or 'immun' in v:
+                        return TraitCategory.IMMUNE
+                    if 'height' in v or 'physical' in v or 'trait' in v:
+                        return TraitCategory.PHYSICAL
+                    # Try exact enum value match (case-insensitive)
+                    for member in TraitCategory:
+                        if member.value.lower() == v:
+                            return member
+                    return TraitCategory.OTHER
+
+                category = _map_category(raw_cat)
                 
                 score = PolygenicScore(
                     pgs_id=row['pgs_id'],
@@ -515,10 +564,10 @@ class PolygenicDatabase:
                     trait_category=category,
                     publication_doi=row['publication_doi'],
                     publication_year=row['publication_year'],
-                    study_population=row['ancestry'],  # Map ancestry to study_population
+                    study_population=row['study_population'],
                     sample_size=row['sample_size'],
                     num_variants=row['num_variants'],
-                    description=row['publication_title'] or '',  # Use publication_title as description
+                    description=row['description'] or '',
                     variants=[]  # Loaded separately for performance
                 )
                 scores.append(score)
@@ -538,10 +587,9 @@ class PolygenicDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # Get score metadata (using actual database schema)
             cursor.execute("""
                 SELECT pgs_id, trait_name, trait_category, publication_doi,
-                       publication_year, ancestry, sample_size, num_variants, publication_title
+                       publication_year, study_population, sample_size, num_variants, description
                 FROM polygenic_scores WHERE pgs_id = ?
             """, (pgs_id,))
             
@@ -554,10 +602,10 @@ class PolygenicDatabase:
             except ValueError:
                 category = TraitCategory.OTHER
             
-            # Get variants (using actual database schema)
             cursor.execute("""
                 SELECT rsid, chromosome, position, effect_allele, other_allele,
-                       effect_weight, allele_frequency
+                       effect_weight, effect_allele_frequency,
+                       dosage_0_weight, dosage_1_weight, dosage_2_weight
                 FROM pgs_variants WHERE pgs_id = ?
             """, (pgs_id,))
             
@@ -570,7 +618,10 @@ class PolygenicDatabase:
                     effect_allele=v_row['effect_allele'] or "",
                     other_allele=v_row['other_allele'] or "",
                     effect_weight=v_row['effect_weight'],
-                    effect_allele_frequency=v_row['allele_frequency']  # Map column name
+                    effect_allele_frequency=v_row['effect_allele_frequency'],
+                    dosage_0_weight=v_row['dosage_0_weight'],
+                    dosage_1_weight=v_row['dosage_1_weight'],
+                    dosage_2_weight=v_row['dosage_2_weight'],
                 )
                 variants.append(variant)
             
@@ -580,10 +631,10 @@ class PolygenicDatabase:
                 trait_category=category,
                 publication_doi=row['publication_doi'],
                 publication_year=row['publication_year'],
-                study_population=row['ancestry'],  # Map ancestry to study_population
+                study_population=row['study_population'],
                 sample_size=row['sample_size'],
                 num_variants=row['num_variants'],
-                description=row['publication_title'] or '',  # Use publication_title as description
+                description=row['description'] or '',
                 variants=variants
             )
     
@@ -664,15 +715,25 @@ class PolygenicDatabase:
         
         return distributions
     
-    def _set_version(self, db_name: str, version: str, source_url: str) -> None:
+    def _set_version(
+        self,
+        db_name: str,
+        version: str,
+        source_url: str,
+        source_type: Optional[str] = None
+    ) -> None:
         """Set version info for a database."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(database_versions)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            if 'source_type' not in existing_columns:
+                cursor.execute("ALTER TABLE database_versions ADD COLUMN source_type TEXT")
             cursor.execute("""
                 INSERT OR REPLACE INTO database_versions
-                (database_name, version, download_date, source_url, record_count)
-                VALUES (?, ?, ?, ?, (SELECT COUNT(*) FROM polygenic_scores))
-            """, (db_name, version, datetime.now().isoformat(), source_url))
+                (database_name, version, download_date, source_url, record_count, source_type)
+                VALUES (?, ?, ?, ?, (SELECT COUNT(*) FROM polygenic_scores), ?)
+            """, (db_name, version, datetime.now().isoformat(), source_url, source_type))
             conn.commit()
     
     def get_version(self, db_name: str) -> Optional[DatabaseVersion]:
@@ -687,11 +748,16 @@ class PolygenicDatabase:
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(database_versions)")
+            version_columns = {row[1] for row in cursor.fetchall()}
+            has_source_type = 'source_type' in version_columns
+
+            source_type_select = ', source_type' if has_source_type else ''
             cursor.execute("""
                 SELECT database_name, version, release_date, download_date,
-                       source_url, record_count, checksum
+                       source_url, record_count, checksum{source_type_select}
                 FROM database_versions WHERE database_name = ?
-            """, (db_name,))
+            """.format(source_type_select=source_type_select), (db_name,))
             
             row = cursor.fetchone()
             if not row:
@@ -713,15 +779,37 @@ class PolygenicDatabase:
                 download_date=download_date,
                 source_url=row['source_url'],
                 record_count=row['record_count'],
-                checksum=row['checksum']
+                checksum=row['checksum'],
+                source_type=row['source_type'] if 'source_type' in row.keys() else None
             )
+
+    def is_sample_pgs_database(self) -> bool:
+        """Return True when the PGS database is still the bundled sample data."""
+        version = self.get_version("pgs_catalog")
+        if not version:
+            return False
+
+        if version.source_type:
+            return version.source_type == 'sample'
+
+        return version.version == '1.0.0' and (version.record_count or 0) <= 10
     
     def get_score_count(self) -> int:
         """Get total number of complete polygenic scores."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM polygenic_scores WHERE download_status = 'complete'")
-            return cursor.fetchone()[0]
+            cursor.execute("PRAGMA table_info(polygenic_scores)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            if "download_status" in columns:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM polygenic_scores WHERE download_status = 'complete'"
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) FROM polygenic_scores")
+
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
 
 class DatabaseVersionManager:
@@ -779,7 +867,8 @@ class DatabaseVersionManager:
                 download_date=datetime.fromisoformat(row['download_date']),
                 source_url=row['source_url'],
                 record_count=row['record_count'],
-                checksum=row.get('checksum')
+                checksum=row['checksum'] if 'checksum' in row.keys() else None,
+                source_type=row['source_type'] if 'source_type' in row.keys() else None
             )
         except sqlite3.Error as e:
             logger.error(f"Error getting GWAS version: {e}")

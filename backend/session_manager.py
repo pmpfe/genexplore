@@ -9,7 +9,7 @@ import gzip
 import json
 import os
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import asdict
 
 from models.data_models import SNPRecord, GWASMatch
@@ -20,6 +20,42 @@ logger = get_logger(__name__)
 
 # File format version for compatibility checking
 SESSION_FORMAT_VERSION = "1.0"
+
+
+def _emit_progress(
+    progress_callback: Optional[Callable[[int, str], None]],
+    percent: int,
+    message: str,
+) -> None:
+    """Emit a progress update if a callback is available."""
+    if progress_callback is None:
+        return
+
+    try:
+        progress_callback(max(0, min(100, int(percent))), message)
+    except Exception:
+        # Progress reporting must never break save/load operations.
+        pass
+
+
+def _stream_collection_progress(
+    progress_callback: Optional[Callable[[int, str], None]],
+    total_items: int,
+    start_percent: int,
+    end_percent: int,
+    label: str,
+    index: int,
+) -> None:
+    """Throttle progress updates while streaming large collections."""
+    if total_items <= 0:
+        _emit_progress(progress_callback, end_percent, f"{label} complete")
+        return
+
+    checkpoint = max(1, total_items // 50)
+    if index == 1 or index == total_items or index % checkpoint == 0:
+        span = max(1, end_percent - start_percent)
+        percent = start_percent + int((index / total_items) * span)
+        _emit_progress(progress_callback, percent, f"{label}: {index:,}/{total_items:,}")
 
 
 class SessionManager:
@@ -39,7 +75,8 @@ class SessionManager:
         snp_records: List[SNPRecord],
         gwas_matches: List[GWASMatch],
         polygenic_results: List[PolygenicResult],
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> bool:
         """
         Save complete analysis session to compressed file.
@@ -55,26 +92,67 @@ class SessionManager:
             bool: True if save was successful
         """
         try:
-            session_data = {
-                "format_version": SESSION_FORMAT_VERSION,
-                "created_at": datetime.now().isoformat(),
-                "metadata": metadata or {},
-                "summary": {
-                    "snp_count": len(snp_records),
-                    "gwas_match_count": len(gwas_matches),
-                    "polygenic_score_count": len(polygenic_results)
-                },
-                "snp_records": [
-                    {
+            _emit_progress(progress_callback, 0, "Preparing session data...")
+
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
+
+            summary = {
+                "snp_count": len(snp_records),
+                "gwas_match_count": len(gwas_matches),
+                "polygenic_score_count": len(polygenic_results)
+            }
+
+            # Stream JSON output directly into a gzip file to avoid building
+            # large intermediate strings in memory.
+            with gzip.open(filepath, 'wt', encoding='utf-8', compresslevel=6) as f:
+                _emit_progress(progress_callback, 5, "Writing session header...")
+                f.write('{')
+                f.write('"format_version":')
+                json.dump(SESSION_FORMAT_VERSION, f, ensure_ascii=False)
+                f.write(',"created_at":')
+                json.dump(datetime.now().isoformat(), f, ensure_ascii=False)
+                f.write(',"metadata":')
+                json.dump(metadata or {}, f, ensure_ascii=False)
+                f.write(',"summary":')
+                json.dump(summary, f, ensure_ascii=False)
+
+                # SNP records array (stream each record)
+                f.write(',"snp_records":[')
+                for i, snp in enumerate(snp_records):
+                    if i:
+                        f.write(',')
+                    snp_obj = {
                         "rsid": snp.rsid,
                         "chromosome": snp.chromosome,
                         "position": snp.position,
-                        "genotype": snp.genotype
+                        "genotype": snp.genotype,
+                        "source_format": snp.source_format,
+                        "source_metadata": snp.source_metadata,
+                        "is_valid": snp.is_valid,
+                        "validation_notes": snp.validation_notes,
+                        "variant_key": snp.variant_key,
                     }
-                    for snp in snp_records
-                ],
-                "gwas_matches": [
-                    {
+                    json.dump(snp_obj, f, ensure_ascii=False)
+                    _stream_collection_progress(
+                        progress_callback,
+                        len(snp_records),
+                        10,
+                        55,
+                        "Writing SNP records",
+                        i + 1,
+                    )
+                f.write(']')
+
+                if not snp_records:
+                    _emit_progress(progress_callback, 55, "Writing SNP records complete")
+
+                # GWAS matches array
+                f.write(',"gwas_matches":[')
+                for i, m in enumerate(gwas_matches):
+                    if i:
+                        f.write(',')
+                    match_obj = {
                         "rsid": m.rsid,
                         "chromosome": m.chromosome,
                         "position": m.position,
@@ -89,10 +167,26 @@ class SessionManager:
                         "allele_frequency": m.allele_frequency,
                         "impact_score": m.impact_score
                     }
-                    for m in gwas_matches
-                ],
-                "polygenic_results": [
-                    {
+                    json.dump(match_obj, f, ensure_ascii=False)
+                    _stream_collection_progress(
+                        progress_callback,
+                        len(gwas_matches),
+                        55,
+                        80,
+                        "Writing GWAS matches",
+                        i + 1,
+                    )
+                f.write(']')
+
+                if not gwas_matches:
+                    _emit_progress(progress_callback, 80, "Writing GWAS matches complete")
+
+                # Polygenic results array
+                f.write(',"polygenic_results":[')
+                for i, r in enumerate(polygenic_results):
+                    if i:
+                        f.write(',')
+                    result_obj = {
                         "pgs_id": r.pgs_id,
                         "trait_name": r.trait_name,
                         "trait_category": r.trait_category.value,
@@ -106,39 +200,39 @@ class SessionManager:
                         "population_reference": r.population_reference,
                         "computation_time_ms": r.computation_time_ms
                     }
-                    for r in polygenic_results
-                ]
-            }
-            
-            # Serialize to JSON and compress
-            json_data = json.dumps(session_data, ensure_ascii=False)
-            compressed_data = gzip.compress(json_data.encode('utf-8'), compresslevel=9)
-            
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
-            
-            with open(filepath, 'wb') as f:
-                f.write(compressed_data)
-            
-            # Log success
-            original_size = len(json_data)
-            compressed_size = len(compressed_data)
-            compression_ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-            
+                    json.dump(result_obj, f, ensure_ascii=False)
+                    _stream_collection_progress(
+                        progress_callback,
+                        len(polygenic_results),
+                        80,
+                        95,
+                        "Writing polygenic scores",
+                        i + 1,
+                    )
+                f.write(']')
+
+                if not polygenic_results:
+                    _emit_progress(progress_callback, 95, "Writing polygenic scores complete")
+
+                f.write('}')
+
+            _emit_progress(progress_callback, 100, "Session file written")
+
+            compressed_size = os.path.getsize(filepath)
             logger.info(
-                f"Session saved: {filepath} "
-                f"({compressed_size:,} bytes, {compression_ratio:.1f}% compression)"
+                f"Session saved: {filepath} ({compressed_size:,} bytes)"
             )
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
             raise
     
     @staticmethod
     def load_session(
-        filepath: str
+        filepath: str,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> Tuple[List[SNPRecord], List[GWASMatch], List[PolygenicResult], Dict[str, Any]]:
         """
         Load complete analysis session from compressed file.
@@ -158,12 +252,15 @@ class SessionManager:
             FileNotFoundError: If file doesn't exist
         """
         try:
-            with open(filepath, 'rb') as f:
-                compressed_data = f.read()
-            
-            # Decompress and parse JSON
-            json_data = gzip.decompress(compressed_data).decode('utf-8')
-            session_data = json.loads(json_data)
+            _emit_progress(progress_callback, 0, "Opening session file...")
+
+            # Stream-load the JSON from the gzip file to avoid building large
+            # intermediate byte strings in memory.
+            with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+                _emit_progress(progress_callback, 10, "Reading compressed session data...")
+                session_data = json.load(f)
+
+            _emit_progress(progress_callback, 20, "Session data read, rebuilding objects...")
             
             # Check format version
             file_version = session_data.get("format_version", "unknown")
@@ -174,21 +271,39 @@ class SessionManager:
             
             # Reconstruct SNP records
             snp_records = []
-            for snp_data in session_data.get("snp_records", []):
+            snp_source = session_data.get("snp_records", [])
+            for index, snp_data in enumerate(snp_source, 1):
                 try:
                     snp = SNPRecord(
-                        rsid=snp_data["rsid"],
+                        rsid=snp_data.get("rsid"),
                         chromosome=snp_data["chromosome"],
                         position=snp_data["position"],
-                        genotype=snp_data["genotype"]
+                        genotype=snp_data["genotype"],
+                        source_format=snp_data.get("source_format", "23andMe raw"),
+                        source_metadata=snp_data.get("source_metadata", {}),
+                        is_valid=snp_data.get("is_valid", True),
+                        validation_notes=snp_data.get("validation_notes", []),
                     )
                     snp_records.append(snp)
                 except (ValueError, KeyError) as e:
                     logger.warning(f"Skipping invalid SNP record: {e}")
+                
+                _stream_collection_progress(
+                    progress_callback,
+                    len(snp_source),
+                    20,
+                    50,
+                    "Rebuilding SNP records",
+                    index,
+                )
+
+            if not snp_source:
+                _emit_progress(progress_callback, 50, "Rebuilding SNP records complete")
             
             # Reconstruct GWAS matches
             gwas_matches = []
-            for match_data in session_data.get("gwas_matches", []):
+            gwas_source = session_data.get("gwas_matches", [])
+            for index, match_data in enumerate(gwas_source, 1):
                 try:
                     match = GWASMatch(
                         rsid=match_data["rsid"],
@@ -208,10 +323,22 @@ class SessionManager:
                     gwas_matches.append(match)
                 except (ValueError, KeyError) as e:
                     logger.warning(f"Skipping invalid GWAS match: {e}")
+                _stream_collection_progress(
+                    progress_callback,
+                    len(gwas_source),
+                    50,
+                    75,
+                    "Rebuilding GWAS matches",
+                    index,
+                )
+
+            if not gwas_source:
+                _emit_progress(progress_callback, 75, "Rebuilding GWAS matches complete")
             
             # Reconstruct polygenic results
             polygenic_results = []
-            for result_data in session_data.get("polygenic_results", []):
+            polygenic_source = session_data.get("polygenic_results", [])
+            for index, result_data in enumerate(polygenic_source, 1):
                 try:
                     # Map trait category string to enum
                     trait_cat = TraitCategory.OTHER
@@ -244,12 +371,25 @@ class SessionManager:
                     polygenic_results.append(result)
                 except (ValueError, KeyError) as e:
                     logger.warning(f"Skipping invalid polygenic result: {e}")
+                _stream_collection_progress(
+                    progress_callback,
+                    len(polygenic_source),
+                    75,
+                    95,
+                    "Rebuilding polygenic scores",
+                    index,
+                )
+
+            if not polygenic_source:
+                _emit_progress(progress_callback, 95, "Rebuilding polygenic scores complete")
             
             # Build metadata
             metadata = session_data.get("metadata", {})
             metadata["file_version"] = file_version
             metadata["created_at"] = session_data.get("created_at")
             metadata["original_summary"] = session_data.get("summary", {})
+
+            _emit_progress(progress_callback, 100, "Session loaded")
             
             logger.info(
                 f"Session loaded: {filepath} "
@@ -279,13 +419,9 @@ class SessionManager:
             Dictionary with summary information
         """
         try:
-            with open(filepath, 'rb') as f:
-                compressed_data = f.read()
-            
-            # Decompress and parse JSON
-            json_data = gzip.decompress(compressed_data).decode('utf-8')
-            session_data = json.loads(json_data)
-            
+            with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+                session_data = json.load(f)
+
             return {
                 "filepath": filepath,
                 "file_size_bytes": os.path.getsize(filepath),
@@ -294,7 +430,7 @@ class SessionManager:
                 "summary": session_data.get("summary", {}),
                 "metadata": session_data.get("metadata", {})
             }
-            
+
         except Exception as e:
             return {
                 "filepath": filepath,

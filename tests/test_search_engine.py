@@ -178,6 +178,24 @@ class TestSearchEngine:
         
         assert len(matches) == 1
         assert 0 <= matches[0].impact_score <= 10
+
+    def test_match_vcf_without_rsid_uses_position_fallback(self, search_engine):
+        """Test that VCF records without rsid can still match by chromosome and position."""
+        user_snps = [
+            SNPRecord(
+                rsid=None,
+                chromosome="8",
+                position=128413305,
+                genotype="GG",
+                source_format="VCF",
+                source_metadata={"variant_key": "8:128413305:A>G"},
+            ),
+        ]
+
+        matches = search_engine.match_user_snps(user_snps)
+
+        assert len(matches) >= 1
+        assert any(match.rsid == "rs6983267" for match in matches)
     
     def test_get_database_stats(self, search_engine):
         """Test getting database statistics."""

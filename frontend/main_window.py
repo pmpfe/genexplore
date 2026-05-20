@@ -4,20 +4,28 @@ Main window UI for the Genetic Analysis Application.
 Implements PyQt6 interface with tabbed layout for monogenic and polygenic analysis.
 """
 
+import os
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional
+from enum import Enum
+import re
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QLineEdit,
     QComboBox, QSlider, QProgressBar, QStatusBar, QMessageBox,
     QHeaderView, QGroupBox, QSpinBox, QFrame, QSplitter, QApplication,
-    QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox, QTabWidget
+    QDialog, QTextEdit, QTextBrowser, QScrollArea, QDialogButtonBox, QTabWidget,
+    QProgressDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QDesktopServices
 
 from models.data_models import SNPRecord, GWASMatch, FilterCriteria
 from models.polygenic_models import PolygenicResult
-from backend.parsers import Parser23andMe, ParseError
+from backend.parsers import ParseError
+from backend.parser_factory import ParserFactory
 from backend.search_engine import SearchEngine, DatabaseError
 from backend.scoring import get_score_interpretation
 from backend.session_manager import SessionManager
@@ -35,8 +43,8 @@ logger = get_logger(__name__)
 
 class ProcessingWorker(QThread):
     """
-    Background worker thread for processing 23andMe files.
-    
+    Background worker thread for processing genetic input files.
+
     Signals:
         finished: Emitted when processing is complete with results (matches, stats, snp_records).
         error: Emitted when an error occurs.
@@ -60,18 +68,40 @@ class ProcessingWorker(QThread):
             self.file_progress.emit(5, "Opening file...")
             self.mono_progress.emit(0, "Waiting...")
             
-            parser = Parser23andMe()
-            
-            # Set up progress callback for file parsing
-            def parsing_progress(lines_processed: int, total_lines: int) -> None:
+            parser = ParserFactory.get_parser(self.filepath)
+
+            # Progress adapters for different parser callback signatures
+            def parsing_progress_lines(lines_processed: int, total_lines: int) -> None:
                 if total_lines > 0:
                     progress_percent = int((lines_processed / total_lines) * 100)
-                    self.file_progress.emit(progress_percent, 
-                                           f"{lines_processed:,}/{total_lines:,} lines")
-            
-            parser.set_progress_callback(parsing_progress)
-            snp_records = parser.parse_file(self.filepath)
-            stats = parser.get_parse_stats()
+                    self.file_progress.emit(progress_percent, f"{lines_processed:,}/{total_lines:,} lines")
+
+            def parsing_progress_percent(percent: int, message: str) -> None:
+                self.file_progress.emit(percent, message)
+
+            # Use inspect_file() when possible to obtain both records and stats.
+            if hasattr(parser, 'set_progress_callback'):
+                # Parser23andMe-style: accepts set_progress_callback(lines_processed, total_lines)
+                parser.set_progress_callback(parsing_progress_lines)
+                inspect_result = parser.inspect_file(self.filepath)
+                # Parser23andMe.inspect_file returns (records, stats)
+                if isinstance(inspect_result, tuple) and len(inspect_result) == 2:
+                    snp_records, stats = inspect_result
+                else:
+                    # Fallback: try parse_file and get_parse_stats
+                    snp_records = parser.parse_file(self.filepath)
+                    stats = parser.get_parse_stats() if hasattr(parser, 'get_parse_stats') else {}
+            else:
+                # VCFStatsParser-style: inspect_file returns an object with .records and .stats
+                try:
+                    vcf_result = parser.inspect_file(self.filepath, progress_callback=parsing_progress_percent)
+                    snp_records = vcf_result.records
+                    stats = vcf_result.stats
+                except TypeError:
+                    # Fallback: no progress callback accepted
+                    vcf_result = parser.inspect_file(self.filepath)
+                    snp_records = getattr(vcf_result, 'records', [])
+                    stats = getattr(vcf_result, 'stats', {})
             
             self.file_progress.emit(100, f"✓ {len(snp_records):,} SNPs loaded")
             
@@ -104,6 +134,50 @@ class ProcessingWorker(QThread):
     def cancel(self) -> None:
         """Cancel the processing operation."""
         self._is_cancelled = True
+
+
+class SessionOperationWorker(QThread):
+    """Background worker for saving and loading analysis sessions."""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(object)
+    error = pyqtSignal(object)
+
+    def __init__(self, operation: str, filepath: str, payload: Optional[dict] = None) -> None:
+        super().__init__()
+        self.operation = operation
+        self.filepath = filepath
+        self.payload = payload or {}
+
+    def run(self) -> None:
+        try:
+            if self.operation == "save":
+                SessionManager.save_session(
+                    filepath=self.filepath,
+                    snp_records=self.payload.get("snp_records", []),
+                    gwas_matches=self.payload.get("gwas_matches", []),
+                    polygenic_results=self.payload.get("polygenic_results", []),
+                    metadata=self.payload.get("metadata", {}),
+                    progress_callback=self._on_progress,
+                )
+                self.finished.emit(self.filepath)
+                return
+
+            if self.operation == "load":
+                result = SessionManager.load_session(
+                    self.filepath,
+                    progress_callback=self._on_progress,
+                )
+                self.finished.emit(result)
+                return
+
+            raise ValueError(f"Unsupported session operation: {self.operation}")
+        except Exception as exc:
+            logger.exception("Session %s failed: %s", self.operation, exc)
+            self.error.emit(exc)
+
+    def _on_progress(self, percent: int, message: str) -> None:
+        self.progress.emit(percent, message)
 
 
 class HelpDialog(QDialog):
@@ -174,7 +248,7 @@ class HelpDialog(QDialog):
         
         <h2>How to Use</h2>
         <ol>
-            <li><b>Upload your data:</b> Click "Upload 23andMe File" and select your raw data file</li>
+            <li><b>Upload your data:</b> Click "upload gene data file" and select your raw data file</li>
             <li><b>Wait for analysis:</b> Three progress bars show:
                 <ul>
                     <li>📁 File loading progress</li>
@@ -557,11 +631,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         
         self.all_matches: List[GWASMatch] = []
+        self.current_matches: List[GWASMatch] = []
         self.filtered_matches: List[GWASMatch] = []
         self.current_page = 0
         self.worker: Optional[ProcessingWorker] = None
         self.snp_records: List[SNPRecord] = []
         self.polygenic_results: List[PolygenicResult] = []
+        self.current_session_metadata: dict = {}
+        self.current_inspection = None
+        self.analysis_started_at = None
+        self.analysis_completed_at = None
+        self._last_loaded_file = None
+        self.session_worker: Optional[SessionOperationWorker] = None
+        self.session_progress_dialog = None
+        self._current_session_operation = None
+        self._current_session_filepath = None
         
         self.search_engine = SearchEngine(DATABASE_PATH)
         
@@ -612,6 +696,14 @@ class MainWindow(QMainWindow):
         self.save_btn.setToolTip("Save analysis results to file")
         header_layout.addWidget(self.save_btn)
         
+        self.export_btn = QPushButton("🌐 Export HTML")
+        self.export_btn.setMinimumWidth(120)
+        self.export_btn.setMinimumHeight(40)
+        self.export_btn.setFont(QFont('Arial', 11))
+        self.export_btn.setEnabled(False)
+        self.export_btn.setToolTip("Export analysis report as a self-contained HTML file")
+        header_layout.addWidget(self.export_btn)
+        
         self.load_btn = QPushButton("📂 Load")
         self.load_btn.setMinimumWidth(80)
         self.load_btn.setMinimumHeight(40)
@@ -619,11 +711,14 @@ class MainWindow(QMainWindow):
         self.load_btn.setToolTip("Load previously saved analysis")
         header_layout.addWidget(self.load_btn)
         
-        self.upload_btn = QPushButton("📁 Upload 23andMe File")
+        self.upload_btn = QPushButton("📁 upload gene data file")
         self.upload_btn.setMinimumWidth(200)
         self.upload_btn.setMinimumHeight(40)
         self.upload_btn.setFont(QFont('Arial', 11))
         header_layout.addWidget(self.upload_btn)
+
+        # Connect export button
+        self.export_btn.clicked.connect(self.export_report)
         
         main_layout.addLayout(header_layout)
         
@@ -714,7 +809,7 @@ class MainWindow(QMainWindow):
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready - Upload a 23andMe file to begin")
+        self.status_bar.showMessage("Ready - upload gene data file to begin")
         
         self._apply_styles()
     
@@ -975,9 +1070,10 @@ class MainWindow(QMainWindow):
         """Handle file upload button click."""
         filepath, _ = QFileDialog.getOpenFileName(
             self,
-            "Select 23andMe Raw Data File",
+            "Select genetic data file (23andMe or VCF)",
             "",
-            "Text Files (*.txt);;All Files (*)"
+            "All Files (*);;23andMe raw text (*.txt);;VCF files (*.vcf *.vcf.gz)",
+            "All Files (*)"
         )
         
         if not filepath:
@@ -986,7 +1082,26 @@ class MainWindow(QMainWindow):
         self._start_processing(filepath)
     
     def _start_processing(self, filepath: str) -> None:
-        """Start processing a 23andMe file in background."""
+        """Start processing a genetic data file in background."""
+        self._last_loaded_file = filepath
+        self.analysis_started_at = datetime.now()
+        try:
+            parser = ParserFactory.get_parser(filepath)
+            detected_format = parser.format_name
+        except Exception:
+            detected_format = 'Unknown'
+        self.current_inspection = SimpleNamespace(
+            filepath=filepath,
+            filename=Path(filepath).name,
+            detected_format=detected_format,
+            file_size_bytes=os.path.getsize(filepath) if os.path.exists(filepath) else None,
+        )
+        self.current_session_metadata = {
+            'snp_file': filepath,
+            'source_filename': Path(filepath).name,
+            'source_format': detected_format,
+            'analysis_started_at': self.analysis_started_at.isoformat(),
+        }
         self.upload_btn.setEnabled(False)
         self.filters_group.setEnabled(False)
         self.progress_frame.setVisible(True)
@@ -1040,12 +1155,25 @@ class MainWindow(QMainWindow):
         self.filters_group.setEnabled(True)
         
         self.all_matches = matches
+        self.current_matches = matches
         self.snp_records = snp_records
         self.current_page = 0
+        self.analysis_completed_at = datetime.now()
+        self.current_session_metadata.update({
+            'analysis_completed_at': self.analysis_completed_at.isoformat(),
+            'source_record_count': len(snp_records),
+            'gwas_match_count': len(matches),
+            'polygenic_score_count': len(self.polygenic_results),
+        })
         
         logger.info(f"Processing complete: {stats}")
         
         self._reset_filters()
+        # Allow exporting monogenic results immediately
+        try:
+            self.export_btn.setEnabled(True)
+        except Exception:
+            pass
         
         # Update genotype status indicator
         self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
@@ -1107,6 +1235,16 @@ class MainWindow(QMainWindow):
         
         # Enable save button now that we have complete results
         self.save_btn.setEnabled(True)
+        # Enable export button as well
+        try:
+            self.export_btn.setEnabled(True)
+        except Exception:
+            pass
+        self.analysis_completed_at = datetime.now()
+        self.current_session_metadata.update({
+            'analysis_completed_at': self.analysis_completed_at.isoformat(),
+            'polygenic_score_count': len(results),
+        })
         
         # Update status bar with final summary
         self.status_bar.showMessage(
@@ -1316,7 +1454,7 @@ class MainWindow(QMainWindow):
         if not self.snp_records:
             QMessageBox.warning(
                 self, "No Data", 
-                "No analysis data to save. Please upload a 23andMe file first."
+                "No analysis data to save. Please upload a genetic data file first."
             )
             return
         
@@ -1333,39 +1471,17 @@ class MainWindow(QMainWindow):
         # Ensure .gxs extension
         if not filepath.endswith('.gxs'):
             filepath += '.gxs'
-        
-        try:
-            self.status_bar.showMessage("Saving session...")
-            QApplication.processEvents()
-            
-            SessionManager.save_session(
-                filepath=filepath,
-                snp_records=self.snp_records,
-                gwas_matches=self.all_matches,
-                polygenic_results=self.polygenic_results,
-                metadata={
-                    "app_version": APP_VERSION,
-                    "snp_file": getattr(self, '_last_loaded_file', None)
-                }
-            )
-            
-            self.status_bar.showMessage(f"Session saved to {filepath}")
-            QMessageBox.information(
-                self, "Session Saved",
-                f"Analysis session saved successfully.\n\n"
-                f"File: {filepath}\n"
-                f"SNPs: {len(self.snp_records):,}\n"
-                f"GWAS matches: {len(self.all_matches):,}\n"
-                f"Polygenic scores: {len(self.polygenic_results)}"
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to save session: {e}")
-            QMessageBox.critical(
-                self, "Save Error",
-                f"Failed to save session:\n{str(e)}"
-            )
-            self.status_bar.showMessage("Save failed")
+        metadata = self._build_session_metadata()
+        self._start_session_operation(
+            "save",
+            filepath,
+            {
+                "snp_records": self.snp_records,
+                "gwas_matches": self.all_matches,
+                "polygenic_results": self.polygenic_results,
+                "metadata": metadata,
+            },
+        )
     
     def _on_load_clicked(self) -> None:
         """Load a previously saved analysis session."""
@@ -1378,64 +1494,773 @@ class MainWindow(QMainWindow):
         
         if not filepath:
             return
-        
-        try:
-            self.status_bar.showMessage("Loading session...")
-            QApplication.processEvents()
-            
-            snp_records, gwas_matches, polygenic_results, metadata = \
-                SessionManager.load_session(filepath)
-            
-            # Update internal state
-            self.snp_records = snp_records
-            self.all_matches = gwas_matches
-            self.polygenic_results = polygenic_results
-            self.current_page = 0
-            
-            # Update UI
-            self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
-            self.genotype_status.setStyleSheet("color: #006000; font-weight: bold;")
-            
-            # Enable filters and save button
-            self.filters_group.setEnabled(True)
-            self.save_btn.setEnabled(True)
-            
-            # Refresh monogenic results table
-            self._reset_filters()
-            
-            # Update polygenic widget with loaded data
-            self.polygenic_widget.set_genotype_data(snp_records)
-            self.polygenic_widget.display_loaded_results(polygenic_results)
-            
-            # Show summary
-            created_at = metadata.get('created_at', 'Unknown')
-            self.status_bar.showMessage(
-                f"✓ Session loaded | {len(snp_records):,} SNPs | "
-                f"{len(gwas_matches):,} matches | {len(polygenic_results)} scores"
-            )
-            
+        self._start_session_operation("load", filepath)
+
+    def _build_session_metadata(self) -> dict:
+        """Assemble metadata for session persistence."""
+        metadata = dict(self.current_session_metadata)
+        metadata.update({
+            "app_version": APP_VERSION,
+            "snp_file": self._last_loaded_file,
+            "source_filename": Path(self._last_loaded_file).name if self._last_loaded_file else metadata.get('source_filename'),
+            "source_format": getattr(self.current_inspection, 'detected_format', metadata.get('source_format')),
+            "source_file_size_bytes": getattr(self.current_inspection, 'file_size_bytes', metadata.get('source_file_size_bytes')),
+            "analysis_started_at": self.analysis_started_at.isoformat() if self.analysis_started_at else metadata.get('analysis_started_at'),
+            "analysis_completed_at": self.analysis_completed_at.isoformat() if self.analysis_completed_at else metadata.get('analysis_completed_at'),
+        })
+        return metadata
+
+    def _start_session_operation(self, operation: str, filepath: str, payload: Optional[dict] = None) -> None:
+        """Run a session save/load operation in the background."""
+        if self.session_worker and self.session_worker.isRunning():
             QMessageBox.information(
-                self, "Session Loaded",
-                f"Analysis session loaded successfully.\n\n"
-                f"Created: {created_at}\n"
-                f"SNPs: {len(snp_records):,}\n"
-                f"GWAS matches: {len(gwas_matches):,}\n"
-                f"Polygenic scores: {len(polygenic_results)}"
+                self,
+                "Operation in progress",
+                "Another session operation is already running. Please wait for it to finish.",
             )
-            
-        except ValueError as e:
+            return
+
+        self._current_session_operation = operation
+        self._current_session_filepath = filepath
+        self._set_session_controls_busy(True)
+
+        title = "Saving session" if operation == "save" else "Loading session"
+        self.session_progress_dialog = QProgressDialog(f"{title}...", None, 0, 100, self)
+        self.session_progress_dialog.setWindowTitle(title)
+        self.session_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.session_progress_dialog.setMinimumDuration(0)
+        self.session_progress_dialog.setAutoClose(False)
+        self.session_progress_dialog.setAutoReset(False)
+        self.session_progress_dialog.setCancelButton(None)
+        self.session_progress_dialog.setValue(0)
+        self.session_progress_dialog.show()
+
+        self.status_bar.showMessage(f"{title}...")
+        QApplication.processEvents()
+
+        self.session_worker = SessionOperationWorker(operation, filepath, payload)
+        self.session_worker.progress.connect(self._on_session_progress)
+        self.session_worker.finished.connect(self._on_session_operation_finished)
+        self.session_worker.error.connect(self._on_session_operation_error)
+        self.session_worker.start()
+
+    def _set_session_controls_busy(self, busy: bool) -> None:
+        """Enable or disable session-related actions while a worker runs."""
+        self.save_btn.setEnabled(not busy and bool(self.snp_records))
+        self.load_btn.setEnabled(not busy)
+        self.upload_btn.setEnabled(not busy)
+        try:
+            self.export_btn.setEnabled(not busy and (bool(self.polygenic_results) or bool(self.all_matches) or bool(self.snp_records)))
+        except Exception:
+            pass
+        self.filters_group.setEnabled(not busy)
+
+    def _close_session_progress_dialog(self) -> None:
+        """Close any session progress dialog currently shown."""
+        if self.session_progress_dialog is not None:
+            self.session_progress_dialog.setValue(100)
+            self.session_progress_dialog.close()
+            self.session_progress_dialog.deleteLater()
+            self.session_progress_dialog = None
+
+    def _on_session_progress(self, value: int, message: str) -> None:
+        """Update the session progress dialog and status bar."""
+        if self.session_progress_dialog is not None:
+            self.session_progress_dialog.setLabelText(message)
+            self.session_progress_dialog.setValue(value)
+        self.status_bar.showMessage(message)
+
+    def _apply_loaded_session(self, filepath: str, snp_records: List[SNPRecord], gwas_matches: List[GWASMatch], polygenic_results: List[PolygenicResult], metadata: dict) -> None:
+        """Apply a loaded session to the current UI state."""
+        self.current_session_metadata = dict(metadata or {})
+        self._last_loaded_file = metadata.get('snp_file') or metadata.get('source_file') or metadata.get('source_filename') or filepath
+        self.analysis_started_at = metadata.get('analysis_started_at')
+        self.analysis_completed_at = metadata.get('analysis_completed_at')
+        source_format = metadata.get('source_format') or metadata.get('detected_format') or 'Session'
+        source_filename = metadata.get('source_filename') or (Path(self._last_loaded_file).name if self._last_loaded_file else Path(filepath).name)
+        self.current_inspection = SimpleNamespace(
+            filepath=self._last_loaded_file or filepath,
+            filename=source_filename,
+            detected_format=source_format,
+            file_size_bytes=metadata.get('source_file_size_bytes'),
+        )
+
+        self.snp_records = snp_records
+        self.all_matches = gwas_matches
+        self.current_matches = gwas_matches
+        self.polygenic_results = polygenic_results
+        self.current_page = 0
+
+        self.genotype_status.setText(f"✓ {len(snp_records):,} SNPs loaded")
+        self.genotype_status.setStyleSheet("color: #006000; font-weight: bold;")
+
+        self.filters_group.setEnabled(True)
+        self._set_session_controls_busy(False)
+
+        self._reset_filters()
+        self.polygenic_widget.set_genotype_data(snp_records)
+        self.polygenic_widget.display_loaded_results(polygenic_results)
+
+    def _on_session_operation_finished(self, result: object) -> None:
+        """Handle completion of a save or load session worker."""
+        operation = self._current_session_operation
+        filepath = self._current_session_filepath or ""
+        self._close_session_progress_dialog()
+        self.session_worker = None
+        self._set_session_controls_busy(False)
+
+        if operation == "save":
+            self.status_bar.showMessage(f"Session saved to {filepath}")
+            QMessageBox.information(
+                self,
+                "Session Saved",
+                f"Analysis session saved successfully.\n\n"
+                f"File: {filepath}\n"
+                f"SNPs: {len(self.snp_records):,}\n"
+                f"GWAS matches: {len(self.all_matches):,}\n"
+                f"Polygenic scores: {len(self.polygenic_results)}",
+            )
+        elif operation == "load":
+            try:
+                snp_records, gwas_matches, polygenic_results, metadata = result  # type: ignore[misc]
+                self._apply_loaded_session(filepath, snp_records, gwas_matches, polygenic_results, metadata)
+
+                created_at = metadata.get('created_at', 'Unknown')
+                self.status_bar.showMessage(
+                    f"✓ Session loaded | {len(snp_records):,} SNPs | "
+                    f"{len(gwas_matches):,} matches | {len(polygenic_results)} scores"
+                )
+                QMessageBox.information(
+                    self,
+                    "Session Loaded",
+                    f"Analysis session loaded successfully.\n\n"
+                    f"Created: {created_at}\n"
+                    f"SNPs: {len(snp_records):,}\n"
+                    f"GWAS matches: {len(gwas_matches):,}\n"
+                    f"Polygenic scores: {len(polygenic_results)}",
+                )
+            except Exception as exc:
+                logger.exception("Loaded session result could not be applied: %s", exc)
+                QMessageBox.critical(
+                    self,
+                    "Load Error",
+                    f"Failed to apply loaded session:\n{exc}",
+                )
+                self.status_bar.showMessage("Load failed")
+        else:
+            self.status_bar.showMessage("Session operation finished")
+
+    def _on_session_operation_error(self, error: object) -> None:
+        """Handle save/load session errors."""
+        operation = self._current_session_operation
+        self._close_session_progress_dialog()
+        self.session_worker = None
+        self._set_session_controls_busy(False)
+
+        if operation == "load" and isinstance(error, ValueError):
             QMessageBox.critical(
-                self, "Invalid File",
-                f"The file is not a valid GenExplore session:\n{str(e)}"
+                self,
+                "Invalid File",
+                f"The file is not a valid GenExplore session:\n{error}",
             )
             self.status_bar.showMessage("Load failed - invalid file")
-        except Exception as e:
-            logger.error(f"Failed to load session: {e}")
-            QMessageBox.critical(
-                self, "Load Error",
-                f"Failed to load session:\n{str(e)}"
+            return
+
+        logger.error("Failed to %s session: %s", operation or "process", error)
+        title = "Save Error" if operation == "save" else "Load Error"
+        action = "save" if operation == "save" else "load"
+        QMessageBox.critical(
+            self,
+            title,
+            f"Failed to {action} session:\n{error}",
+        )
+        self.status_bar.showMessage(f"{title.replace(' Error', '')} failed")
+
+    def export_report(self) -> None:
+        """Export current analysis to a self-contained HTML report with filtering, sorting and detailed anchors."""
+        try:
+            filepath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Report",
+                "",
+                "HTML Files (*.html);;All Files (*)"
             )
-            self.status_bar.showMessage("Load failed")
+
+            if not filepath:
+                return
+
+            if not filepath.lower().endswith('.html'):
+                filepath += '.html'
+
+            import html as html_lib
+
+            from database.polygenic_database import DatabaseVersionManager, get_gwas_database_stats
+
+            def _fmt_text(value, default='N/A'):
+                if value is None or value == '':
+                    return default
+                if isinstance(value, Enum):
+                    return value.value
+                return str(value)
+
+            def _fmt_datetime(value):
+                if value is None or value == '':
+                    return 'N/A'
+                if isinstance(value, datetime):
+                    return value.strftime('%Y-%m-%d %H:%M:%S')
+                if isinstance(value, str):
+                    try:
+                        return datetime.fromisoformat(value).strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        return value
+                return str(value)
+
+            def _slugify(value):
+                slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', str(value)).strip('-').lower()
+                return slug or 'item'
+
+            def _safe_float_text(value):
+                if value is None or value == '':
+                    return 'N/A'
+                try:
+                    return f'{float(value):.1f}%'
+                except Exception:
+                    return html_lib.escape(str(value))
+
+            def _human_file_size(size_bytes):
+                if size_bytes in (None, '', 0):
+                    return 'N/A' if size_bytes in (None, '') else '0 B'
+                try:
+                    size = float(size_bytes)
+                except Exception:
+                    return 'N/A'
+                units = ['B', 'KB', 'MB', 'GB', 'TB']
+                unit_index = 0
+                while size >= 1024 and unit_index < len(units) - 1:
+                    size /= 1024.0
+                    unit_index += 1
+                return f'{int(size)} {units[unit_index]}' if unit_index == 0 else f'{size:.2f} {units[unit_index]}'
+
+            def _resolve_current_context():
+                metadata = dict(getattr(self, 'current_session_metadata', {}) or {})
+                inspection = getattr(self, 'current_inspection', None)
+                source_path = (
+                    getattr(inspection, 'filepath', None)
+                    or metadata.get('snp_file')
+                    or self._last_loaded_file
+                )
+                source_filename = (
+                    getattr(inspection, 'filename', None)
+                    or metadata.get('source_filename')
+                    or (Path(source_path).name if source_path else 'Unknown')
+                )
+                detected_format = (
+                    getattr(inspection, 'detected_format', None)
+                    or metadata.get('source_format')
+                    or metadata.get('detected_format')
+                    or 'Unknown'
+                )
+                file_size_bytes = (
+                    getattr(inspection, 'file_size_bytes', None)
+                    or metadata.get('source_file_size_bytes')
+                )
+                return metadata, source_path, source_filename, detected_format, file_size_bytes
+
+            vm = DatabaseVersionManager()
+            gwas_ver = vm.get_gwas_version()
+            pgs_ver = vm.get_pgs_version()
+            gwas_stats = get_gwas_database_stats() or {}
+
+            metadata, source_path, source_filename, detected_format, file_size_bytes = _resolve_current_context()
+            matches = list(getattr(self, 'current_matches', None) or self.all_matches or [])
+            poly_results = list(self.polygenic_results or [])
+            poly_score_lookup = {
+                getattr(score, 'pgs_id', None): score
+                for score in getattr(self.polygenic_widget, 'scores', []) or []
+                if getattr(score, 'pgs_id', None)
+            }
+
+            analysis_started = getattr(self, 'analysis_started_at', None) or metadata.get('analysis_started_at')
+            analysis_completed = getattr(self, 'analysis_completed_at', None) or metadata.get('analysis_completed_at')
+
+            css = """
+            :root { color-scheme: light; }
+            html { scroll-behavior: smooth; }
+            body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;margin:24px;color:#1f2328;background:#fbfcfe}
+            .shell{max-width:1280px;margin:0 auto}
+            header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:18px 20px;background:linear-gradient(135deg,#ffffff 0%,#f2f7ff 100%);border:1px solid #dde6f3;border-radius:16px;box-shadow:0 10px 30px rgba(20,40,80,.05)}
+            h1{margin:0;font-size:2rem;letter-spacing:-0.02em}
+            h2{margin:0 0 10px 0;font-size:1.35rem}
+            h3{margin:18px 0 8px 0}
+            .muted{color:#5b6573}
+            .badge{display:inline-block;padding:5px 10px;border-radius:999px;background:#e9f2ff;color:#124ea0;font-weight:700}
+            .index-links{display:flex;flex-wrap:wrap;gap:8px}
+            .index-links a{display:inline-block;padding:8px 12px;border-radius:999px;background:#eef5ff;color:#114a9c;text-decoration:none;font-weight:700}
+            .index-links a:hover{background:#dbeafe}
+            .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}
+            .card{background:#fff;border:1px solid #e3e8ef;border-radius:14px;padding:16px 18px;box-shadow:0 8px 24px rgba(20,40,80,.04)}
+            .card.wide{grid-column:1/-1}
+            .section{margin-top:18px}
+            .toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:18px 0;padding:14px 16px;background:#fff;border:1px solid #e3e8ef;border-radius:14px}
+            .toolbar label{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+            input[type=search], input[type=number]{padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;min-width:220px}
+            select{padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;min-width:220px;background:#fff}
+            table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;border:1px solid #e3e8ef;border-radius:14px;overflow:hidden}
+            thead th{position:sticky;top:0;background:#f6f8fb;padding:11px 10px;border-bottom:1px solid #e3e8ef;text-align:left;cursor:pointer;white-space:nowrap}
+            tbody td{padding:10px;border-bottom:1px solid #eef2f7;vertical-align:top}
+            tbody tr:hover{background:#fbfdff}
+            .sortable::after{content:' ↕';color:#8a94a3;font-weight:400}
+            .details-link,.action-link{display:inline-block;padding:6px 10px;border-radius:999px;background:#0b5fff;color:#fff;text-decoration:none;font-weight:700;line-height:1}
+            .details-link:hover,.action-link:hover{background:#084bc0}
+            .details-link.secondary{background:#0f9d58}
+            .details-link.secondary:hover{background:#0b8043}
+            .tag{display:inline-block;padding:3px 8px;border-radius:999px;background:#f1f5f9;color:#334155;font-size:.85rem}
+            .small{font-size:.92rem;color:#5b6573}
+            .detail-anchor{scroll-margin-top:18px}
+            .detail-block{margin-top:14px;padding:16px 18px;border:1px solid #e3e8ef;border-radius:14px;background:#fff}
+            .detail-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+            .detail-meta div{padding:10px 12px;background:#f8fafc;border:1px solid #edf2f7;border-radius:10px}
+            .detail-meta strong{display:block;margin-bottom:3px}
+            .detail-links{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px 0}
+            .detail-note{margin-top:10px;padding:10px 12px;border-left:4px solid #0b5fff;background:#f4f8ff;color:#1f3a5f;border-radius:8px}
+            .contributors{margin-top:10px;width:100%}
+            .contributors th{cursor:default}
+            footer{margin:26px 0 10px;color:#667085;font-size:.9rem}
+            @media print{.toolbar,.details-link,.action-link,header .actions{display:none}}
+            """
+
+            js = """
+            function sortTable(table){
+                const headers = Array.from(table.querySelectorAll('thead th.sortable'));
+                headers.forEach((header, index) => {
+                    header.addEventListener('click', () => {
+                        const tbody = table.querySelector('tbody');
+                        const rows = Array.from(tbody.querySelectorAll('tr'));
+                        const numeric = header.dataset.type === 'numeric';
+                        const nextOrder = header.dataset.order === 'asc' ? 'desc' : 'asc';
+                        headers.forEach(h => { delete h.dataset.order; });
+                        header.dataset.order = nextOrder;
+                        rows.sort((left, right) => {
+                            const leftCell = left.children[index];
+                            const rightCell = right.children[index];
+                            const leftValue = leftCell.dataset.value ?? leftCell.innerText;
+                            const rightValue = rightCell.dataset.value ?? rightCell.innerText;
+                            if (numeric) {
+                                const leftNumber = parseFloat(leftValue) || 0;
+                                const rightNumber = parseFloat(rightValue) || 0;
+                                return nextOrder === 'asc' ? leftNumber - rightNumber : rightNumber - leftNumber;
+                            }
+                            return nextOrder === 'asc'
+                                ? String(leftValue).localeCompare(String(rightValue))
+                                : String(rightValue).localeCompare(String(leftValue));
+                        });
+                        rows.forEach(row => tbody.appendChild(row));
+                    });
+                });
+            }
+
+            function applyFilters(){
+                const gwasQuery = (document.getElementById('gwasSearch')?.value || '').toLowerCase();
+                const gwasMinImpact = parseFloat(document.getElementById('gwasMinImpact')?.value || '0') || 0;
+                const gwasCategory = (document.getElementById('gwasCategory')?.value || 'ALL').toLowerCase();
+
+                document.querySelectorAll('#gwasTable tbody tr').forEach(row => {
+                    const text = row.innerText.toLowerCase();
+                    const impact = parseFloat(row.dataset.impact || '0') || 0;
+                    const category = (row.dataset.category || '').toLowerCase();
+                    const matchesQuery = !gwasQuery || text.includes(gwasQuery);
+                    const matchesImpact = impact >= gwasMinImpact;
+                    const matchesCategory = gwasCategory === 'all' || category === gwasCategory;
+                    row.style.display = matchesQuery && matchesImpact && matchesCategory ? '' : 'none';
+                });
+
+                const polyQuery = (document.getElementById('polySearch')?.value || '').toLowerCase();
+                const polyMinCoverage = parseFloat(document.getElementById('polyMinCoverage')?.value || '0') || 0;
+                const polyRisk = (document.getElementById('polyRiskCategory')?.value || 'ALL').toLowerCase();
+                const polyTraitCategory = (document.getElementById('polyTraitCategory')?.value || 'ALL').toLowerCase();
+
+                document.querySelectorAll('#polygenicTable tbody tr').forEach(row => {
+                    const text = row.innerText.toLowerCase();
+                    const coverage = parseFloat(row.dataset.coverage || '0') || 0;
+                    const risk = (row.dataset.riskCategory || '').toLowerCase();
+                    const traitCategory = (row.dataset.traitCategory || '').toLowerCase();
+                    const matchesQuery = !polyQuery || text.includes(polyQuery);
+                    const matchesCoverage = coverage >= polyMinCoverage;
+                    const matchesRisk = polyRisk === 'all' || risk === polyRisk;
+                    const matchesTraitCategory = polyTraitCategory === 'all' || traitCategory === polyTraitCategory;
+                    row.style.display = matchesQuery && matchesCoverage && matchesRisk && matchesTraitCategory ? '' : 'none';
+                });
+            }
+
+            document.addEventListener('DOMContentLoaded', () => {
+                const gwasSearch = document.getElementById('gwasSearch');
+                const gwasMinImpact = document.getElementById('gwasMinImpact');
+                const gwasCategory = document.getElementById('gwasCategory');
+                const polySearch = document.getElementById('polySearch');
+                const polyMinCoverage = document.getElementById('polyMinCoverage');
+                const polyRiskCategory = document.getElementById('polyRiskCategory');
+                const polyTraitCategory = document.getElementById('polyTraitCategory');
+
+                [gwasSearch, gwasMinImpact, gwasCategory, polySearch, polyMinCoverage, polyRiskCategory, polyTraitCategory].forEach(control => {
+                    if (control) control.addEventListener('input', applyFilters);
+                    if (control) control.addEventListener('change', applyFilters);
+                });
+
+                const gwasTable = document.getElementById('gwasTable');
+                const polygenicTable = document.getElementById('polygenicTable');
+                if (gwasTable) sortTable(gwasTable);
+                if (polygenicTable) sortTable(polygenicTable);
+                applyFilters();
+            });
+            """
+
+            def _gwas_impact(match):
+                impact = getattr(match, 'impact_score', None)
+                return impact if impact is not None else getattr(match, 'impact', None)
+
+            def _fmt_risk_label(value):
+                if isinstance(value, Enum):
+                    return value.value
+                if value is None or value == '':
+                    return 'N/A'
+                return str(value)
+
+            parts = []
+            parts.append('<!doctype html>')
+            parts.append('<html lang="en">')
+            parts.append('<head>')
+            parts.append('<meta charset="utf-8">')
+            parts.append('<meta name="viewport" content="width=device-width,initial-scale=1">')
+            parts.append(f'<title>{html_lib.escape(APP_NAME)} Report</title>')
+            parts.append(f'<style>{css}</style>')
+            parts.append('</head>')
+            parts.append('<body>')
+            parts.append('<div class="shell">')
+            parts.append('<header>')
+            parts.append('<div>')
+            parts.append(f'<h1>{html_lib.escape(APP_NAME)} — Genetic Exploration Report</h1>')
+            parts.append(f'<div class="muted">Generated on {html_lib.escape(_fmt_datetime(datetime.now()))}</div>')
+            parts.append('</div>')
+            parts.append('<div class="actions">')
+            parts.append(f'<span class="badge">{len(matches):,} GWAS matches</span>')
+            parts.append(f' <span class="badge">{len(poly_results):,} polygenic scores</span>')
+            parts.append('</div>')
+            parts.append('</header>')
+
+            parts.append('<section class="card wide" id="index">')
+            parts.append('<h2>Index</h2>')
+            parts.append('<div class="index-links">')
+            for anchor, label in [
+                ('#sample-info', 'Sample Information'),
+                ('#summary', 'Summary'),
+                ('#gwas-section', 'Monogenic Analysis'),
+                ('#polygenic-section', 'Polygenic Analysis'),
+                ('#methodology', 'Methodology & Limitations'),
+                ('#details', 'Details'),
+            ]:
+                parts.append(f'<a href="{anchor}">{html_lib.escape(label)}</a>')
+            parts.append('</div>')
+            parts.append('</section>')
+
+            parts.append('<div class="grid">')
+            parts.append('<section class="card">')
+            parts.append('<h2>Sample Information</h2>')
+            parts.append('<div class="detail-meta">')
+            parts.append(f'<div><strong>File</strong>{html_lib.escape(_fmt_text(source_filename, "Unknown"))}</div>')
+            parts.append(f'<div><strong>Path</strong>{html_lib.escape(_fmt_text(source_path, "Unknown"))}</div>')
+            parts.append(f'<div><strong>Detected format</strong>{html_lib.escape(_fmt_text(detected_format, "Unknown"))}</div>')
+            parts.append(f'<div><strong>File size</strong>{html_lib.escape(_human_file_size(file_size_bytes))}</div>')
+            parts.append(f'<div><strong>Analysis started</strong>{html_lib.escape(_fmt_datetime(analysis_started))}</div>')
+            parts.append(f'<div><strong>Analysis completed</strong>{html_lib.escape(_fmt_datetime(analysis_completed))}</div>')
+            parts.append('</div>')
+            parts.append('</section>')
+
+            parts.append('<section class="card">')
+            parts.append('<h2>Summary</h2>')
+            parts.append('<div class="detail-meta">')
+            if gwas_ver:
+                parts.append(f'<div><strong>GWAS DB version</strong>{html_lib.escape(_fmt_text(gwas_ver.version))}</div>')
+                parts.append(f'<div><strong>GWAS records</strong>{html_lib.escape(f"{gwas_ver.record_count:,}")}</div>')
+            if pgs_ver:
+                parts.append(f'<div><strong>PGS DB version</strong>{html_lib.escape(_fmt_text(pgs_ver.version))}</div>')
+                parts.append(f'<div><strong>PGS records</strong>{html_lib.escape(f"{pgs_ver.record_count:,}")}</div>')
+            if gwas_stats.get('variants') is not None:
+                parts.append(f'<div><strong>GWAS variants</strong>{html_lib.escape(f"{gwas_stats.get('variants'):,}")}</div>')
+            parts.append(f'<div><strong>Monogenic matches</strong>{html_lib.escape(f"{len(matches):,}")}</div>')
+            parts.append(f'<div><strong>Polygenic scores</strong>{html_lib.escape(f"{len(poly_results):,}")}</div>')
+            parts.append('</div>')
+            parts.append('</section>')
+            parts.append('</div>')
+
+            parts.append('<section class="section" id="gwas-section">')
+            parts.append('<h2>GWAS Matches</h2>')
+            parts.append(f'<p class="small">Found {len(matches):,} monogenic matches.</p>')
+            parts.append('<section class="toolbar">')
+            parts.append('<label>Search <input id="gwasSearch" type="search" placeholder="Search traits, genes, SNP IDs"></label>')
+            parts.append('<label>Min. Impact Score <input id="gwasMinImpact" type="number" min="0" max="10" step="0.1" value="0"></label>')
+            parts.append('<label>Category <select id="gwasCategory"><option value="ALL">All</option>')
+            for category_label in TRAIT_CATEGORIES:
+                parts.append(f'<option value="{html_lib.escape(category_label)}">{html_lib.escape(category_label)}</option>')
+            parts.append('</select></label>')
+            parts.append('</section>')
+            parts.append('<table id="gwasTable">')
+            parts.append('<thead><tr>')
+            for label, type_name in [
+                ('SNP ID', 'text'), ('Gene', 'text'), ('Trait', 'text'), ('User Genotype', 'text'),
+                ('Risk Allele', 'text'), ('P-value', 'numeric'), ('Category', 'text'), ('Impact Score', 'numeric'),
+                ('Interpretation', 'text'), ('Details', 'text')
+            ]:
+                parts.append(f'<th class="sortable" data-type="{type_name}">{html_lib.escape(label)}</th>')
+            parts.append('</tr></thead><tbody>')
+
+            for match in matches:
+                rsid = getattr(match, 'rsid', '')
+                detail_id = f'gwas-detail-{_slugify(rsid or match.trait)}'
+                impact_score = _gwas_impact(match)
+                interpretation = get_score_interpretation(impact_score) if impact_score is not None else 'N/A'
+                p_value = getattr(match, 'p_value', None)
+                p_value_text = f'{p_value:.2e}' if p_value is not None else 'N/A'
+                category_text = _fmt_text(getattr(match, 'category', None))
+                parts.append(f'<tr data-impact="{html_lib.escape(str(impact_score if impact_score is not None else 0))}" data-category="{html_lib.escape(category_text.lower())}">')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(rsid))}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(getattr(match, "gene", None), "-"))}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(getattr(match, "trait", None)))}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(getattr(match, "user_genotype", None)))}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(getattr(match, "risk_allele", None)))}</td>')
+                parts.append(f'<td data-value="{html_lib.escape(str(p_value if p_value is not None else 0))}">{html_lib.escape(p_value_text)}</td>')
+                parts.append(f'<td>{html_lib.escape(category_text)}</td>')
+                parts.append(f'<td data-value="{html_lib.escape(str(impact_score if impact_score is not None else 0))}">{html_lib.escape(f"{impact_score:.2f}" if impact_score is not None else "N/A")}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(interpretation))}</td>')
+                parts.append(f'<td><a class="action-link" href="#{detail_id}">Explain</a></td>')
+                parts.append('</tr>')
+
+            parts.append('</tbody></table>')
+            parts.append('</section>')
+
+            parts.append('<section class="section" id="polygenic-section">')
+            parts.append('<h2>Polygenic Risk Scores</h2>')
+            parts.append(f'<p class="small">Found {len(poly_results):,} computed scores.</p>')
+            parts.append('<section class="toolbar">')
+            parts.append('<label>Search <input id="polySearch" type="search" placeholder="Search traits, PGS IDs"></label>')
+            parts.append('<label>Min. Coverage <input id="polyMinCoverage" type="number" min="0" max="100" step="0.1" value="0"></label>')
+            parts.append('<label>Risk Category <select id="polyRiskCategory"><option value="ALL">All</option><option value="LOW">Low</option><option value="INTERMEDIATE">Intermediate</option><option value="HIGH">High</option></select></label>')
+            parts.append('<label>Trait Category <select id="polyTraitCategory"><option value="ALL">All</option>')
+            for category_label in TRAIT_CATEGORIES:
+                parts.append(f'<option value="{html_lib.escape(category_label)}">{html_lib.escape(category_label)}</option>')
+            parts.append('</select></label>')
+            parts.append('</section>')
+            parts.append('<table id="polygenicTable">')
+            parts.append('<thead><tr>')
+            for label, type_name in [
+                ('PGS ID', 'text'), ('Trait', 'text'), ('Category', 'text'), ('Variants', 'numeric'),
+                ('Coverage', 'numeric'), ('Percentile', 'numeric'), ('Risk', 'text'), ('Details', 'text')
+            ]:
+                parts.append(f'<th class="sortable" data-type="{type_name}">{html_lib.escape(label)}</th>')
+            parts.append('</tr></thead><tbody>')
+
+            for result in poly_results:
+                score = getattr(result, 'score', None) or poly_score_lookup.get(getattr(result, 'pgs_id', None))
+                pgs_id = getattr(result, 'pgs_id', None) or getattr(score, 'pgs_id', None)
+                trait_name = getattr(result, 'trait_name', None) or getattr(score, 'trait_name', None) or getattr(score, 'trait_reported', None)
+                trait_category = getattr(result, 'trait_category', None) or getattr(score, 'trait_category', None)
+                variants_found = getattr(result, 'variants_found', None)
+                variants_total = getattr(result, 'variants_total', None)
+                coverage_percent = getattr(result, 'coverage_percent', None)
+                percentile = getattr(result, 'percentile', None)
+                risk_category = getattr(result, 'risk_category', None)
+                detail_id = f'poly-detail-{_slugify(pgs_id or trait_name)}'
+
+                category_text = _fmt_text(trait_category)
+                risk_text = _fmt_risk_label(risk_category)
+                variants_text = f'{variants_found:,} / {variants_total:,}' if variants_found is not None and variants_total is not None else _fmt_text(variants_found)
+                coverage_value = coverage_percent if coverage_percent is not None else 0
+                percentile_value = percentile if percentile is not None else 0
+
+                parts.append(f'<tr data-coverage="{html_lib.escape(str(coverage_value))}" data-risk-category="{html_lib.escape(risk_text.lower())}" data-trait-category="{html_lib.escape(category_text.lower())}">')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(pgs_id))}</td>')
+                parts.append(f'<td>{html_lib.escape(_fmt_text(trait_name))}</td>')
+                parts.append(f'<td>{html_lib.escape(category_text)}</td>')
+                parts.append(f'<td data-value="{html_lib.escape(str(variants_found if variants_found is not None else 0))}">{html_lib.escape(variants_text)}</td>')
+                parts.append(f'<td data-value="{html_lib.escape(str(coverage_value))}">{html_lib.escape(f"{coverage_value:.0f}%" if coverage_percent is not None else "N/A")}</td>')
+                parts.append(f'<td data-percentile="{html_lib.escape(str(percentile_value))}" data-value="{html_lib.escape(str(percentile_value))}">{html_lib.escape(_safe_float_text(percentile))}</td>')
+                parts.append(f'<td>{html_lib.escape(risk_text)}</td>')
+                parts.append(f'<td><a class="details-link secondary" href="#{detail_id}">View</a></td>')
+                parts.append('</tr>')
+
+            parts.append('</tbody></table>')
+            parts.append('</section>')
+
+            parts.append('<section class="section" id="methodology">')
+            parts.append('<h2>Methodology & Limitations</h2>')
+            parts.append('<div class="card">')
+            parts.append('<p class="small">')
+            parts.append('This report combines your genotype file with local GWAS and PGS catalog data. ')
+            parts.append('Monogenic matches summarize individual variant associations, while polygenic scores are population-based estimates.')
+            parts.append('</p>')
+            parts.append('<p class="small">')
+            parts.append('Low coverage reduces confidence in a score. Risk categories are derived from percentile thresholds and may not transfer across ancestries.')
+            parts.append('</p>')
+            parts.append('</div>')
+            parts.append('</section>')
+
+            total_pgs_variants = sum(
+                getattr(score, 'num_variants', 0) or 0
+                for score in getattr(self.polygenic_widget, 'scores', []) or []
+            )
+            pgs_scores_loaded = len(getattr(self.polygenic_widget, 'scores', []) or [])
+
+            parts.append('<section class="section" id="database-stats">')
+            parts.append('<h2>Database Statistics</h2>')
+            parts.append('<div class="grid">')
+            parts.append('<div class="card">')
+            parts.append('<h3>GWAS Catalog</h3>')
+            parts.append('<div class="detail-meta">')
+            parts.append(f'<div><strong>Version</strong>{html_lib.escape(_fmt_text(getattr(gwas_ver, "version", None), "N/A"))}</div>')
+            parts.append(f'<div><strong>Records</strong>{html_lib.escape(f"{getattr(gwas_ver, 'record_count', 0):,}" if gwas_ver else "N/A")}</div>')
+            parts.append(f'<div><strong>Variants</strong>{html_lib.escape(f"{gwas_stats.get('variants', 0):,}" if gwas_stats.get('variants') is not None else "N/A")}</div>')
+            parts.append(f'<div><strong>Traits</strong>{html_lib.escape(f"{gwas_stats.get('traits', 0):,}" if gwas_stats.get('traits') is not None else "N/A")}</div>')
+            parts.append(f'<div><strong>Genes</strong>{html_lib.escape(f"{gwas_stats.get('genes', 0):,}" if gwas_stats.get('genes') is not None else "N/A")}</div>')
+            parts.append(f'<div><strong>Associations</strong>{html_lib.escape(f"{gwas_stats.get('associations', 0):,}" if gwas_stats.get('associations') is not None else "N/A")}</div>')
+            parts.append('</div>')
+            parts.append('</div>')
+            parts.append('<div class="card">')
+            parts.append('<h3>PGS Catalog</h3>')
+            parts.append('<div class="detail-meta">')
+            parts.append(f'<div><strong>Version</strong>{html_lib.escape(_fmt_text(getattr(pgs_ver, "version", None), "N/A"))}</div>')
+            parts.append(f'<div><strong>Scores loaded</strong>{html_lib.escape(f"{pgs_scores_loaded:,}" if pgs_scores_loaded else "0")}</div>')
+            parts.append(f'<div><strong>Variant definitions</strong>{html_lib.escape(f"{total_pgs_variants:,}" if total_pgs_variants else "0")}</div>')
+            parts.append(f'<div><strong>Sample source</strong>{html_lib.escape(_fmt_text(getattr(pgs_ver, "source_type", None), "catalog"))}</div>')
+            parts.append('</div>')
+            parts.append('</div>')
+            parts.append('</div>')
+            parts.append('</section>')
+
+            parts.append('<section class="section" id="details">')
+            parts.append('<h2>Details</h2>')
+            parts.append('<p class="small">Use the links above to jump to each card. These anchors restore the original Explain/View workflow.</p>')
+
+            for match in matches:
+                rsid = getattr(match, 'rsid', '')
+                detail_id = f'gwas-detail-{_slugify(rsid or match.trait)}'
+                impact_score = _gwas_impact(match)
+                parts.append(f'<div class="detail-block detail-anchor" id="{detail_id}">')
+                parts.append(f'<h3>Explain: {html_lib.escape(_fmt_text(rsid))}</h3>')
+                detail_links = []
+                if rsid:
+                    detail_links.append(f'<a class="details-link" href="https://www.ncbi.nlm.nih.gov/snp/{html_lib.escape(str(rsid))}" target="_blank" rel="noopener noreferrer">dbSNP</a>')
+                    detail_links.append(f'<a class="details-link" href="https://www.ebi.ac.uk/gwas/variants/{html_lib.escape(str(rsid))}" target="_blank" rel="noopener noreferrer">GWAS Catalog</a>')
+                gene_name = getattr(match, 'gene', None)
+                if gene_name:
+                    detail_links.append(f'<a class="details-link secondary" href="https://www.genecards.org/Search/Keyword?queryString={html_lib.escape(str(gene_name))}" target="_blank" rel="noopener noreferrer">GeneCards</a>')
+                if detail_links:
+                    parts.append('<div class="detail-links">' + ' '.join(detail_links) + '</div>')
+                parts.append('<div class="detail-meta">')
+                for label, value in [
+                    ('Gene', getattr(match, 'gene', None)),
+                    ('Trait', getattr(match, 'trait', None)),
+                    ('Chromosome', getattr(match, 'chromosome', None)),
+                    ('Position', f'{getattr(match, "position", None):,}' if getattr(match, 'position', None) is not None else None),
+                    ('User genotype', getattr(match, 'user_genotype', None)),
+                    ('Risk allele', getattr(match, 'risk_allele', None)),
+                    ('P-value', f'{getattr(match, "p_value", 0):.2e}' if getattr(match, 'p_value', None) is not None else None),
+                    ('Category', getattr(match, 'category', None)),
+                    ('Impact score', f'{impact_score:.2f}' if impact_score is not None else None),
+                    ('Interpretation', get_score_interpretation(impact_score) if impact_score is not None else None),
+                    ('Odds ratio', f'{getattr(match, "odds_ratio", None):.2f}' if getattr(match, 'odds_ratio', None) is not None else None),
+                    ('Sample size', f'{getattr(match, "sample_size", None):,}' if getattr(match, 'sample_size', None) is not None else None),
+                    ('Allele frequency', f'{getattr(match, "allele_frequency", None):.1%}' if getattr(match, 'allele_frequency', None) is not None else None),
+                ]:
+                    parts.append(f'<div><strong>{html_lib.escape(label)}</strong>{html_lib.escape(_fmt_text(value))}</div>')
+                parts.append('</div>')
+                parts.append('<div class="detail-note">')
+                if getattr(match, 'has_risk_allele', lambda: False)():
+                    parts.append('You carry the reported risk allele for this association. This is not diagnostic and should be interpreted in context.')
+                else:
+                    parts.append('You do not carry the reported risk allele for this association.')
+                parts.append('</div>')
+                parts.append('<p><a class="action-link" href="#gwas-section">Back to GWAS table</a></p>')
+                parts.append('</div>')
+
+            for result in poly_results:
+                score = getattr(result, 'score', None) or poly_score_lookup.get(getattr(result, 'pgs_id', None))
+                pgs_id = getattr(result, 'pgs_id', None) or getattr(score, 'pgs_id', None)
+                trait_name = getattr(result, 'trait_name', None) or getattr(score, 'trait_name', None) or getattr(score, 'trait_reported', None)
+                detail_id = f'poly-detail-{_slugify(pgs_id or trait_name)}'
+                parts.append(f'<div class="detail-block detail-anchor" id="{detail_id}">')
+                parts.append(f'<h3>View: {html_lib.escape(_fmt_text(trait_name))}</h3>')
+                detail_links = []
+                publication_doi = getattr(result, 'publication_doi', None) or (getattr(score, 'publication_doi', None) if score else None)
+                score_pgs_id = pgs_id or (getattr(score, 'pgs_id', None) if score else None)
+                if publication_doi:
+                    detail_links.append(f'<a class="details-link" href="https://doi.org/{html_lib.escape(str(publication_doi))}" target="_blank" rel="noopener noreferrer">DOI</a>')
+                if score_pgs_id:
+                    detail_links.append(f'<a class="details-link secondary" href="https://www.pgscatalog.org/score/{html_lib.escape(str(score_pgs_id))}/" target="_blank" rel="noopener noreferrer">PGS Catalog</a>')
+                if trait_name:
+                    trait_search = str(trait_name).replace(' ', '+')
+                    detail_links.append(f'<a class="details-link" href="https://pubmed.ncbi.nlm.nih.gov/?term={html_lib.escape(trait_search)}+polygenic" target="_blank" rel="noopener noreferrer">PubMed</a>')
+                if detail_links:
+                    parts.append('<div class="detail-links">' + ' '.join(detail_links) + '</div>')
+                parts.append('<div class="detail-meta">')
+                for label, value in [
+                    ('PGS ID', pgs_id),
+                    ('Category', getattr(result, 'trait_category', None) or getattr(score, 'trait_category', None)),
+                    ('Raw score', f'{getattr(result, "raw_score", 0):.4f}' if getattr(result, 'raw_score', None) is not None else None),
+                    ('Normalized score', f'{getattr(result, "normalized_score", 0):.2f}' if getattr(result, 'normalized_score', None) is not None else None),
+                    ('Percentile', _safe_float_text(getattr(result, 'percentile', None))),
+                    ('Risk category', _fmt_risk_label(getattr(result, 'risk_category', None))),
+                    ('Variants found', f'{getattr(result, "variants_found", 0):,}' if getattr(result, 'variants_found', None) is not None else None),
+                    ('Variants total', f'{getattr(result, "variants_total", 0):,}' if getattr(result, 'variants_total', None) is not None else None),
+                    ('Coverage', f'{getattr(result, "coverage_percent", 0):.0f}%' if getattr(result, 'coverage_percent', None) is not None else None),
+                    ('Population reference', getattr(result, 'population_reference', None)),
+                    ('Computation time', f'{getattr(result, "computation_time_ms", 0):.0f} ms' if getattr(result, 'computation_time_ms', None) is not None else None),
+                ]:
+                    parts.append(f'<div><strong>{html_lib.escape(label)}</strong>{html_lib.escape(_fmt_text(value))}</div>')
+                parts.append('</div>')
+
+                if score:
+                    parts.append('<h4>Scientific Context</h4>')
+                    parts.append('<div class="detail-meta">')
+                    for label, value in [
+                        ('Trait name', getattr(score, 'trait_name', None)),
+                        ('Publication year', getattr(score, 'publication_year', None)),
+                        ('Population', getattr(score, 'study_population', None)),
+                        ('Sample size', f'{getattr(score, "sample_size", 0):,}' if getattr(score, 'sample_size', None) is not None else None),
+                        ('Variant count', f'{getattr(score, "num_variants", 0):,}' if getattr(score, 'num_variants', None) is not None else None),
+                        ('Description', getattr(score, 'description', None)),
+                    ]:
+                        parts.append(f'<div><strong>{html_lib.escape(label)}</strong>{html_lib.escape(_fmt_text(value))}</div>')
+                    parts.append('</div>')
+
+                if getattr(result, 'variant_contributions', None):
+                    parts.append('<h4>Top Contributing Variants</h4>')
+                    parts.append('<table class="contributors">')
+                    parts.append('<thead><tr><th>Variant</th><th>Contribution</th></tr></thead><tbody>')
+                    for rsid, contribution in result.get_top_contributors(10):
+                        parts.append(f'<tr><td>{html_lib.escape(_fmt_text(rsid))}</td><td>{html_lib.escape(f"{contribution:.4f}")}</td></tr>')
+                    parts.append('</tbody></table>')
+
+                parts.append('<p><a class="action-link" href="#polygenic-section">Back to polygenic table</a></p>')
+                parts.append('</div>')
+
+            parts.append('</section>')
+            parts.append('<footer>')
+            parts.append(f'Report generated by {html_lib.escape(APP_NAME)} v{html_lib.escape(str(APP_VERSION))}.')
+            parts.append(f' <a href="https://github.com/pmpfe/genexplore" target="_blank" rel="noopener noreferrer">Project on GitHub</a>')
+            parts.append('</footer>')
+            parts.append('</div>')
+            parts.append(f'<script>{js}</script>')
+            parts.append('</body></html>')
+
+            html = '\n'.join(parts)
+            with open(filepath, 'w', encoding='utf-8') as fh:
+                fh.write(html)
+
+            self.status_bar.showMessage(f'Report exported to {filepath}')
+            QMessageBox.information(self, 'Export Complete', f'Report exported to:\n{filepath}')
+
+        except Exception as e:
+            logger.error(f'Failed to export report: {e}')
+            QMessageBox.critical(self, 'Export Failed', f'Failed to export report:\n{str(e)}')
     
     def _on_prev_page(self) -> None:
         """Go to previous page."""

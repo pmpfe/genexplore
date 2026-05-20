@@ -10,12 +10,15 @@ Features:
 - Progress indicators with time estimates
 - Separate GWAS and PGS updates
 - Smart PGS filtering (excludes scores with >100K variants for performance)
+- Optional command flags for direct integration with the app UI
 
 Usage:
-    python update_databases.py gwas      # Update GWAS only
-    python update_databases.py pgs       # Update PGS only
-    python update_databases.py all       # Update both
-    python update_databases.py status    # Show current status
+    python update_databases.py --gwas      # Update GWAS only
+    python update_databases.py --pgs       # Update PGS only
+    python update_databases.py --all       # Update both
+    python update_databases.py --status    # Show current status
+    python update_databases.py pgs        # Legacy positional form still supported
+    python update_databases.py status     # Legacy positional form still supported
 """
 
 import os
@@ -26,6 +29,7 @@ import sqlite3
 import time
 import argparse
 import hashlib
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Set
 from pathlib import Path
@@ -47,7 +51,7 @@ GWAS_ZIP_URL = "https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-ca
 PGS_API_BASE = "https://www.pgscatalog.org/rest"
 
 # Limits for PGS (scores with >100K variants are too large)
-MAX_VARIANTS_PER_SCORE = 100_000
+DEFAULT_MAX_VARIANTS_PER_SCORE = 100_000
 REQUEST_TIMEOUT = 60
 REQUEST_DELAY = 0.5  # Be nice to the API
 
@@ -98,6 +102,105 @@ def format_size(bytes_size: int) -> str:
             return f"{bytes_size:.1f} {unit}"
         bytes_size /= 1024
     return f"{bytes_size:.1f} TB"
+
+
+def _extract_download_url(value: Optional[str]) -> Optional[str]:
+    """Extract a usable URL from API payloads and rendered documentation strings."""
+    if not value:
+        return None
+
+    match = re.search(r'https?://[^\s\]\)]+', value)
+    if match:
+        return match.group(0)
+
+    cleaned = value.strip()
+    if cleaned.startswith(('http://', 'https://', 'ftp://')):
+        return cleaned
+
+    return None
+
+
+def _split_score_fields(line: str) -> List[str]:
+    """Split a PGS scoring-file line across mixed whitespace and tab separators."""
+    return [field for field in re.split(r'\s+', line.strip()) if field]
+
+
+def _get_score_field(fields: List[str], index: Optional[int]) -> Optional[str]:
+    """Safely read a parsed scoring-file field by index."""
+    if index is None or index < 0 or index >= len(fields):
+        return None
+    return fields[index]
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table_name: str, column_definitions: Dict[str, str]) -> None:
+    """Add any missing columns to a SQLite table."""
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    for column_name, column_definition in column_definitions.items():
+        if column_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+
+
+def _normalize_trait_category_str(value: Optional[str]) -> str:
+    """Normalize a raw `trait_category` string to canonical DB values.
+
+    Returns one of the canonical strings used by `TraitCategory` enum.
+    """
+    v = (value or '').strip().lower()
+    if not v:
+        return 'Other'
+    if 'metabolic' in v or 'metab' in v:
+        return 'Metabolic'
+    if 'cardio' in v or 'cardiovascular' in v:
+        return 'Cardiovascular'
+    if 'neuro' in v or 'psychiatr' in v or 'mental' in v:
+        return 'Neuropsychiatric'
+    if 'oncolog' in v or 'cancer' in v or 'tumor' in v:
+        return 'Oncology'
+    if 'immune' in v or 'immun' in v:
+        return 'Immune'
+    if 'height' in v or 'physical' in v or 'trait' in v:
+        return 'Physical Trait'
+    canonical = {
+        'metabolic': 'Metabolic',
+        'cardiovascular': 'Cardiovascular',
+        'neuropsychiatric': 'Neuropsychiatric',
+        'oncology': 'Oncology',
+        'immune': 'Immune',
+        'physical trait': 'Physical Trait',
+        'other': 'Other',
+    }
+    return canonical.get(v, 'Other')
+
+
+def _infer_trait_category(raw_value: Optional[str], trait: Optional[str]) -> str:
+    """Infer the canonical trait category using raw API value, falling back to trait name heuristics."""
+    # Prefer explicit category from API when available
+    cat = _normalize_trait_category_str(raw_value)
+    if cat != 'Other':
+        return cat
+
+    t = (trait or '').strip().lower()
+    if not t:
+        return 'Other'
+
+    # Heuristics based on common keywords in trait names
+    if any(k in t for k in ['cholesterol', 'lipid', 'glucose', 'diabet', 'hdl', 'ldl', 'triglycer', 'insulin', 'bmi']):
+        return 'Metabolic'
+    if any(k in t for k in ['heart', 'cardio', 'stroke', 'coronary', 'blood pressure', 'hypertension', 'atrial']):
+        return 'Cardiovascular'
+    if any(k in t for k in ['depress', 'schiz', 'autism', 'neuro', 'alzheimer', 'parkinson', 'cognitive', 'anxiety', 'psychiatr']):
+        return 'Neuropsychiatric'
+    if any(k in t for k in ['cancer', 'tumor', 'carcinoma', 'melanoma', 'leukemia']):
+        return 'Oncology'
+    if any(k in t for k in ['immune', 'immun', 'inflamm', 'allerg', 'autoimmun']):
+        return 'Immune'
+    if any(k in t for k in ['height', 'weight', 'bmi', 'physical', 'body fat']):
+        return 'Physical Trait'
+
+    return 'Other'
 
 
 # =============================================================================
@@ -396,6 +499,33 @@ def init_pgs_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    _add_missing_columns(conn, 'polygenic_scores', {
+        'trait_efo_id': 'trait_efo_id TEXT',
+        'publication_title': 'publication_title TEXT',
+        'num_variants_downloaded': 'num_variants_downloaded INTEGER DEFAULT 0',
+        'ancestry': 'ancestry TEXT',
+        'genome_build': 'genome_build TEXT',
+        'download_status': "download_status TEXT DEFAULT 'pending'",
+    })
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS database_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            database_name TEXT UNIQUE NOT NULL,
+            version TEXT NOT NULL,
+            release_date TEXT,
+            download_date TEXT NOT NULL,
+            source_url TEXT,
+            record_count INTEGER,
+            checksum TEXT,
+            source_type TEXT
+        )
+    """)
+
+    _add_missing_columns(conn, 'database_versions', {
+        'source_type': 'source_type TEXT',
+    })
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS pgs_variants (
@@ -407,10 +537,17 @@ def init_pgs_db() -> None:
             effect_allele TEXT,
             other_allele TEXT,
             effect_weight REAL NOT NULL,
-            allele_frequency REAL,
+            effect_allele_frequency REAL,
             FOREIGN KEY (pgs_id) REFERENCES polygenic_scores(pgs_id)
         )
     """)
+
+    _add_missing_columns(conn, 'pgs_variants', {
+        'effect_allele_frequency': 'effect_allele_frequency REAL',
+        'dosage_0_weight': 'dosage_0_weight REAL',
+        'dosage_1_weight': 'dosage_1_weight REAL',
+        'dosage_2_weight': 'dosage_2_weight REAL',
+    })
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS metadata (
@@ -438,54 +575,100 @@ def get_all_pgs_metadata() -> List[Dict]:
     
     with tqdm(desc="Fetching score list", unit="scores") as pbar:
         while next_url:
-            try:
-                response = requests.get(next_url, timeout=REQUEST_TIMEOUT)
-                response.raise_for_status()
-                data = response.json()
-                
-                results = data.get('results', [])
-                all_scores.extend(results)
-                pbar.update(len(results))
-                
-                next_url = data.get('next')
-                page += 1
-                
-                # Rate limiting
-                time.sleep(REQUEST_DELAY)
-                
-            except requests.RequestException as e:
-                print(f"\n⚠️ Error fetching page {page}: {e}")
+            response = None
+            last_error = None
+            succeeded = False
+            for attempt in range(1, 4):
+                try:
+                    response = requests.get(next_url, timeout=REQUEST_TIMEOUT)
+                    if response.status_code in {500, 502, 503, 504}:
+                        raise requests.RequestException(f"HTTP {response.status_code}")
+                    response.raise_for_status()
+                    succeeded = True
+                    break
+                except requests.RequestException as e:
+                    last_error = e
+                    if attempt < 3:
+                        time.sleep(min(REQUEST_DELAY * attempt * 2, 5.0))
+                        continue
+            if not succeeded or response is None:
+                print(f"\n⚠️ Error fetching page {page}: {last_error}")
                 break
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                print(f"\n⚠️ Error decoding page {page}: {e}")
+                break
+
+            results = data.get('results', [])
+            all_scores.extend(results)
+            pbar.update(len(results))
+
+            next_url = data.get('next')
+            page += 1
+
+            # Rate limiting
+            time.sleep(REQUEST_DELAY)
     
     return all_scores
 
 
-def download_pgs_scoring_file(pgs_id: str) -> Optional[List[Dict]]:
+def download_pgs_scoring_file(score: Dict) -> Optional[List[Dict]]:
     """
     Download scoring file for a PGS score.
     
     Returns list of variant dictionaries or None if failed.
     """
-    # Scoring file URL format
-    url = f"https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{pgs_id}/ScoringFiles/{pgs_id}.txt.gz"
+    pgs_id = score.get('id')
+    if not pgs_id:
+        print("   ❌ Missing PGS identifier in score metadata")
+        return None
+
+    # Prefer the API-provided download link; fall back to the historical URL pattern.
+    url = _extract_download_url(score.get('ftp_scoring_file'))
+    if not url:
+        url = f"https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{pgs_id}/ScoringFiles/{pgs_id}.txt.gz"
     
+    response = None
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code in {500, 502, 503, 504}:
+                raise requests.RequestException(f"HTTP {response.status_code}")
+            response.raise_for_status()
+            last_error = None
+            break
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < 3:
+                time.sleep(min(REQUEST_DELAY * attempt * 2, 5.0))
+                continue
+            print(f"   ❌ {pgs_id}: download failed from {url} after 3 attempts ({e})")
+            return None
+
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        
-        # Decompress gzip
-        content = gzip.decompress(response.content).decode('utf-8')
+        # Decompress gzip when needed, but tolerate plain-text responses too.
+        content = response.content
+        try:
+            content = gzip.decompress(content)
+        except OSError:
+            pass
+
+        content = content.decode('utf-8', errors='replace')
         lines = content.strip().split('\n')
-        
+
         # Skip header comments
         data_lines = [l for l in lines if not l.startswith('#')]
         if not data_lines:
+            print(f"   ❌ {pgs_id}: downloaded file contained no parseable rows")
             return None
-        
+
         # Parse header
-        header = data_lines[0].split('\t')
+        header = _split_score_fields(data_lines[0])
         header_lower = [h.lower().strip() for h in header]
-        
+
         # Map columns
         col_map = {}
         for i, col in enumerate(header_lower):
@@ -503,58 +686,97 @@ def download_pgs_scoring_file(pgs_id: str) -> Optional[List[Dict]]:
                 col_map['weight'] = i
             elif col in ['allelefrequency_effect', 'eaf', 'effect_allele_frequency']:
                 col_map['frequency'] = i
-        
-        # Must have weight column
-        if 'weight' not in col_map:
+            elif col in ['dosage_0_weight', 'dosage0_weight']:
+                col_map['dosage_0_weight'] = i
+            elif col in ['dosage_1_weight', 'dosage1_weight']:
+                col_map['dosage_1_weight'] = i
+            elif col in ['dosage_2_weight', 'dosage2_weight']:
+                col_map['dosage_2_weight'] = i
+
+        uses_dosage_weights = all(key in col_map for key in ['dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight'])
+        if 'weight' not in col_map and not uses_dosage_weights:
+            print(f"   ❌ {pgs_id}: unsupported scoring-file header: {' '.join(header_lower)}")
             return None
-        
+
         variants = []
+        malformed_rows = 0
         for line in data_lines[1:]:
-            cols = line.split('\t')
-            
+            cols = _split_score_fields(line)
+
             try:
-                weight = float(cols[col_map['weight']])
+                if 'weight' in col_map:
+                    weight = float(cols[col_map['weight']])
+                    dosage_0_weight = None
+                    dosage_1_weight = None
+                    dosage_2_weight = None
+                else:
+                    dosage_0_weight = float(cols[col_map['dosage_0_weight']])
+                    dosage_1_weight = float(cols[col_map['dosage_1_weight']])
+                    dosage_2_weight = float(cols[col_map['dosage_2_weight']])
+                    weight = dosage_1_weight
             except (ValueError, IndexError):
+                malformed_rows += 1
                 continue
-            
-            variant = {
-                'rsid': cols[col_map.get('rsid', -1)] if col_map.get('rsid', -1) < len(cols) else None,
-                'chromosome': cols[col_map.get('chromosome', -1)] if col_map.get('chromosome', -1) < len(cols) else None,
-                'position': None,
-                'effect_allele': cols[col_map.get('effect_allele', -1)] if col_map.get('effect_allele', -1) < len(cols) else None,
-                'other_allele': cols[col_map.get('other_allele', -1)] if col_map.get('other_allele', -1) < len(cols) else None,
-                'weight': weight,
-                'frequency': None
-            }
-            
-            # Parse position
+
+            chromosome = _get_score_field(cols, col_map.get('chromosome'))
+            position = None
             if col_map.get('position') is not None and col_map['position'] < len(cols):
                 try:
-                    variant['position'] = int(cols[col_map['position']])
+                    position = int(cols[col_map['position']])
                 except ValueError:
                     pass
-            
+
+            rsid = _get_score_field(cols, col_map.get('rsid'))
+            if not rsid and chromosome and position is not None:
+                rsid = f"{chromosome}:{position}"
+
+            variant = {
+                'rsid': rsid,
+                'chromosome': chromosome,
+                'position': position,
+                'effect_allele': _get_score_field(cols, col_map.get('effect_allele')),
+                'other_allele': _get_score_field(cols, col_map.get('other_allele')),
+                'weight': weight,
+                'frequency': None,
+                'dosage_0_weight': dosage_0_weight,
+                'dosage_1_weight': dosage_1_weight,
+                'dosage_2_weight': dosage_2_weight,
+            }
+
             # Parse frequency
             if col_map.get('frequency') is not None and col_map['frequency'] < len(cols):
                 try:
                     variant['frequency'] = float(cols[col_map['frequency']])
                 except ValueError:
                     pass
-            
+
             variants.append(variant)
-        
+
+        if not variants:
+            print(f"   ❌ {pgs_id}: no variants parsed from scoring file ({malformed_rows} malformed rows)")
+            return None
+
+        if malformed_rows:
+            print(f"   ⚠️ {pgs_id}: parsed {len(variants)} variants, skipped {malformed_rows} malformed rows")
+
         return variants
-        
+
     except Exception as e:
+        print(f"   ❌ {pgs_id}: unexpected parsing error ({e})")
         return None
 
 
-def update_pgs(state: Dict, resume: bool = True) -> bool:
+def update_pgs(
+    state: Dict,
+    resume: bool = True,
+    limit: Optional[int] = None,
+    max_variants_per_score: int = DEFAULT_MAX_VARIANTS_PER_SCORE,
+) -> bool:
     """
     Download and update PGS database.
     
     Features:
-    - Skips scores with >100K variants (too large)
+    - Skips scores above a configurable variant threshold (default 100K)
     - Resumable (tracks processed scores)
     - Progress with time estimates
     """
@@ -575,13 +797,13 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
     # Filter out huge scores
     eligible_scores = [
         s for s in all_scores 
-        if (s.get('variants_number') or 0) <= MAX_VARIANTS_PER_SCORE
+        if (s.get('variants_number') or 0) <= max_variants_per_score
     ]
     
     huge_scores = len(all_scores) - len(eligible_scores)
     total_variants = sum(s.get('variants_number', 0) for s in eligible_scores)
     
-    print(f"   Eligible scores (≤{MAX_VARIANTS_PER_SCORE:,} variants): {len(eligible_scores):,}")
+    print(f"   Eligible scores (≤{max_variants_per_score:,} variants): {len(eligible_scores):,}")
     print(f"   Skipped (too large): {huge_scores:,}")
     print(f"   Total variants to download: {total_variants:,}")
     
@@ -593,8 +815,20 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
         print(f"   Already processed: {len(processed):,}")
         print(f"   Previously failed: {len(failed):,}")
     
-    # Filter to only unprocessed
-    to_process = [s for s in eligible_scores if s.get('id') not in processed]
+    failed: Set[str] = set()
+    if resume:
+        failed = set(state["pgs"].get("failed_scores", []))
+
+    # Filter to only unprocessed, then prioritize retries for previously failed scores.
+    if resume:
+        retry_failed = [s for s in eligible_scores if s.get('id') in failed and s.get('id') not in processed]
+        fresh_new = [s for s in eligible_scores if s.get('id') not in processed and s.get('id') not in failed]
+        to_process = retry_failed + fresh_new
+    else:
+        to_process = list(eligible_scores)
+
+    if limit is not None and limit > 0:
+        to_process = to_process[:limit]
     
     if not to_process:
         print("\n✅ All eligible scores already downloaded!")
@@ -603,6 +837,12 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
     # Calculate remaining work
     remaining_variants = sum(s.get('variants_number', 0) for s in to_process)
     print(f"\n📥 Scores to download: {len(to_process):,}")
+    if resume:
+        retry_failed = [s for s in to_process if s.get('id') in failed]
+        fresh_new = [s for s in to_process if s.get('id') not in failed]
+        if failed:
+            print(f"   Previously failed (will retry): {len(retry_failed):,}")
+            print(f"   New scores not yet attempted: {len(fresh_new):,}")
     print(f"   Variants remaining: {remaining_variants:,}")
     
     # Estimate time (based on ~500 variants/second average)
@@ -631,11 +871,12 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
             continue
         
         # Download scoring file
-        variants = download_pgs_scoring_file(pgs_id)
+        variants = download_pgs_scoring_file(score)
         
         if variants is None:
             scores_failed += 1
             state["pgs"]["failed_scores"] = list(set(state["pgs"].get("failed_scores", [])) | {pgs_id})
+            print(f"   ❌ {pgs_id}: failed to download or parse scoring file")
             pbar.update(num_variants)  # Still advance progress
             continue
         
@@ -661,7 +902,7 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
             # Get primary ancestry (highest percentage)
             ancestry = max(dist.keys(), key=lambda k: dist.get(k, 0)) if dist else None
             
-            cursor.execute("""
+                cursor.execute("""
                 INSERT OR REPLACE INTO polygenic_scores (
                     pgs_id, trait_name, trait_category, trait_efo_id,
                     publication_doi, publication_year, publication_title,
@@ -671,7 +912,7 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
             """, (
                 pgs_id,
                 trait[:500] if trait else 'Unknown',
-                score.get('trait_category', 'Other'),
+                _infer_trait_category(score.get('trait_category'), trait),
                 trait_efo_id,
                 pub_doi,
                 pub_year,
@@ -694,8 +935,9 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
                 cursor.executemany("""
                     INSERT INTO pgs_variants (
                         pgs_id, rsid, chromosome, position,
-                        effect_allele, other_allele, effect_weight, allele_frequency
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        effect_allele, other_allele, effect_weight, effect_allele_frequency,
+                        dosage_0_weight, dosage_1_weight, dosage_2_weight
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [(
                     pgs_id,
                     v['rsid'],
@@ -704,7 +946,10 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
                     v['effect_allele'],
                     v['other_allele'],
                     v['weight'],
-                    v['frequency']
+                    v['frequency'],
+                    v.get('dosage_0_weight'),
+                    v.get('dosage_1_weight'),
+                    v.get('dosage_2_weight'),
                 ) for v in batch])
             
             conn.commit()
@@ -714,12 +959,14 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
             
             # Update state (save periodically)
             state["pgs"]["processed_scores"] = list(set(state["pgs"].get("processed_scores", [])) | {pgs_id})
+            state["pgs"]["failed_scores"] = [score_id for score_id in state["pgs"].get("failed_scores", []) if score_id != pgs_id]
             if scores_done % 10 == 0:
                 save_state(state)
             
-        except sqlite3.Error as e:
+        except Exception as e:
             scores_failed += 1
             conn.rollback()
+            print(f"   ❌ {pgs_id}: database write failed ({e})")
         
         # Update progress bar
         pbar.update(num_variants)
@@ -747,6 +994,22 @@ def update_pgs(state: Dict, resume: bool = True) -> bool:
     state["pgs"]["total_scores"] = scores_done
     state["pgs"]["total_variants"] = variants_done
     save_state(state)
+
+    stored_scores = cursor.execute("SELECT COUNT(*) FROM polygenic_scores").fetchone()[0]
+    cursor.execute("""
+        INSERT OR REPLACE INTO database_versions
+        (database_name, version, release_date, download_date, source_url, record_count, checksum, source_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        'pgs_catalog',
+        'PGS Catalog',
+        None,
+        datetime.now().isoformat(),
+        PGS_API_BASE,
+        stored_scores,
+        None,
+        'catalog'
+    ))
     
     # Update metadata
     cursor.execute(
@@ -799,7 +1062,7 @@ def show_status() -> None:
             print(f"   Last update: {last_update}")
         except sqlite3.OperationalError:
             print(f"   Status: ⚠️ Database exists but not initialized")
-            print(f"   Run 'python update_databases.py gwas' to initialize")
+            print(f"   Run 'python update_databases.py --gwas' to initialize")
         conn.close()
     else:
         print(f"   Status: ❌ Not downloaded")
@@ -832,7 +1095,7 @@ def show_status() -> None:
                 print(f"   ⚠️ Failed downloads: {failed}")
         except sqlite3.OperationalError:
             print(f"   Status: ⚠️ Database exists but not initialized")
-            print(f"   Run 'python update_databases.py pgs' to initialize")
+            print(f"   Run 'python update_databases.py --pgs' to initialize")
         conn.close()
     else:
         print(f"   Status: ❌ Not downloaded")
@@ -848,10 +1111,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python update_databases.py gwas      # Update GWAS only
-    python update_databases.py pgs       # Update PGS only  
-    python update_databases.py all       # Update both
-    python update_databases.py status    # Show current status
+    python update_databases.py --gwas      # Update GWAS only
+    python update_databases.py --pgs       # Update PGS only  
+    python update_databases.py --all       # Update both
+    python update_databases.py --status    # Show current status
+    python update_databases.py pgs        # Legacy positional form still supported
 
 Notes:
     - Downloads are resumable (safe to interrupt)
@@ -863,17 +1127,61 @@ Notes:
     
     parser.add_argument(
         'command',
+        nargs='?',
         choices=['gwas', 'pgs', 'all', 'status'],
-        help='What to update'
+        help='Legacy positional command (optional)'
     )
+
+    parser.add_argument('--gwas', action='store_true', help='Update GWAS only')
+    parser.add_argument('--pgs', action='store_true', help='Update PGS only')
+    parser.add_argument('--all', action='store_true', help='Update both databases')
+    parser.add_argument('--status', action='store_true', help='Show database status')
     
     parser.add_argument(
         '--fresh',
         action='store_true',
         help='Start fresh (ignore previous progress)'
     )
+
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit the number of PGS scores processed (useful for testing)'
+    )
+
+    parser.add_argument(
+        '--max-variants',
+        type=int,
+        default=DEFAULT_MAX_VARIANTS_PER_SCORE,
+        help='Maximum variants allowed for a PGS score before it is skipped'
+    )
     
     args = parser.parse_args()
+
+    command_flags = [flag for flag, enabled in {
+        'gwas': args.gwas,
+        'pgs': args.pgs,
+        'all': args.all,
+        'status': args.status,
+    }.items() if enabled]
+
+    if args.command and command_flags:
+        parser.error('Use either a positional command or the flag form, not both')
+
+    if command_flags:
+        if len(command_flags) > 1:
+            parser.error('Choose exactly one command flag')
+        args.command = command_flags[0]
+
+    if not args.command:
+        parser.error('Please provide a command: --gwas, --pgs, --all, --status, or a positional legacy command')
+
+    if args.limit is not None and args.limit <= 0:
+        parser.error('--limit must be a positive integer')
+
+    if args.max_variants <= 0:
+        parser.error('--max-variants must be a positive integer')
     
     # Load or initialize state
     state = load_state()
@@ -905,7 +1213,12 @@ Notes:
         success = update_gwas(state) and success
     
     if args.command in ['pgs', 'all']:
-        success = update_pgs(state, resume=not args.fresh) and success
+        success = update_pgs(
+            state,
+            resume=not args.fresh,
+            limit=args.limit,
+            max_variants_per_score=args.max_variants,
+        ) and success
     
     if success:
         print("\n" + "="*60)

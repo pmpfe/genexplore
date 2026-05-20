@@ -3,7 +3,8 @@ Search engine for matching user SNPs against GWAS database.
 """
 
 import sqlite3
-from typing import List, Optional, Dict, Any
+from collections import defaultdict
+from typing import List, Optional, Dict, Any, Callable, Tuple
 from contextlib import contextmanager
 
 from models.data_models import SNPRecord, GWASMatch, FilterCriteria
@@ -93,7 +94,11 @@ class SearchEngine:
         except DatabaseError:
             return False
     
-    def match_user_snps(self, user_snps: List[SNPRecord]) -> List[GWASMatch]:
+    def match_user_snps(
+        self,
+        user_snps: List[SNPRecord],
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[GWASMatch]:
         """
         Match a list of user SNPs against the GWAS database.
         
@@ -107,13 +112,38 @@ class SearchEngine:
             DatabaseError: If database query fails.
         """
         matches: List[GWASMatch] = []
-        rsid_to_genotype = {snp.rsid: snp.genotype for snp in user_snps}
+        rsid_to_genotype: Dict[str, str] = {}
+        positional_to_genotype: Dict[Tuple[str, int], str] = {}
+
+        for snp in user_snps:
+            if snp.rsid:
+                rsid_to_genotype[snp.rsid] = snp.genotype
+            else:
+                positional_to_genotype[(snp.chromosome, snp.position)] = snp.genotype
+
         rsids = list(rsid_to_genotype.keys())
-        
-        logger.info(f"Searching for {len(rsids)} SNPs in GWAS database")
-        
-        # Process in batches to avoid SQLite variable limit (max ~999)
+        positions = list(positional_to_genotype.keys())
+
+        logger.info(
+            "Searching GWAS database for %s rsIDs and %s chrom/pos fallback keys",
+            len(rsids),
+            len(positions),
+        )
+
         BATCH_SIZE = 500
+        total_batches = ((len(rsids) + BATCH_SIZE - 1) // BATCH_SIZE) + ((len(positions) + BATCH_SIZE - 1) // BATCH_SIZE)
+        completed_batches = 0
+
+        def _report_progress(message: str) -> None:
+            if progress_callback and total_batches > 0:
+                percent = int((completed_batches / total_batches) * 100)
+                progress_callback(percent, total_batches, message)
+            logger.info(
+                "GWAS matching progress: %s/%s batches - %s",
+                completed_batches,
+                total_batches,
+                message,
+            )
         
         try:
             with self._get_connection() as conn:
@@ -121,6 +151,8 @@ class SearchEngine:
                 
                 for i in range(0, len(rsids), BATCH_SIZE):
                     batch_rsids = rsids[i:i + BATCH_SIZE]
+                    completed_batches += 1
+                    _report_progress(f"Matching RSIDs {i + 1:,}-{min(i + BATCH_SIZE, len(rsids)):,}...")
                     
                     placeholders = ','.join('?' * len(batch_rsids))
                     query = f"""
@@ -147,6 +179,8 @@ class SearchEngine:
                     for row in cursor.fetchall():
                         rsid = row['variant_id']
                         user_genotype = rsid_to_genotype.get(rsid, '')
+                        if not user_genotype:
+                            continue
                         
                         p_value = row['p_value']
                         af = row['af_overall']
@@ -172,6 +206,78 @@ class SearchEngine:
                             impact_score=impact_score
                         )
                         matches.append(match)
+
+                position_seen: set[Tuple[str, int, str]] = set()
+                for i in range(0, len(positions), BATCH_SIZE):
+                    batch_positions = positions[i:i + BATCH_SIZE]
+                    completed_batches += 1
+                    _report_progress(f"Matching chrom/pos {i + 1:,}-{min(i + BATCH_SIZE, len(positions)):,}...")
+
+                    if not batch_positions:
+                        continue
+
+                    position_clauses = ' OR '.join('(g.chromosome = ? AND g.position = ?)' for _ in batch_positions)
+                    query = f"""
+                        SELECT
+                            g.variant_id,
+                            g.chromosome,
+                            g.position,
+                            g.risk_allele,
+                            g.reported_trait,
+                            g.mapped_gene,
+                            g.p_value,
+                            g.odds_ratio,
+                            g.sample_size,
+                            g.category,
+                            COALESCE(a.af_overall, ?) as af_overall
+                        FROM gwas_variants g
+                        LEFT JOIN allele_frequencies a ON g.variant_id = a.variant_id
+                        WHERE {position_clauses}
+                    """
+
+                    params: List[Any] = [DEFAULT_ALLELE_FREQUENCY]
+                    for chromosome, position in batch_positions:
+                        params.extend([chromosome, position])
+
+                    cursor.execute(query, params)
+
+                    for row in cursor.fetchall():
+                        lookup_key = (row['variant_id'], row['chromosome'], row['position'])
+                        if lookup_key in position_seen:
+                            continue
+                        position_seen.add(lookup_key)
+
+                        user_genotype = positional_to_genotype.get((row['chromosome'], row['position']), '')
+                        if not user_genotype:
+                            continue
+
+                        p_value = row['p_value']
+                        af = row['af_overall']
+
+                        try:
+                            impact_score = calculate_impact_score(p_value, af)
+                        except ValueError:
+                            impact_score = 5.0
+
+                        match = GWASMatch(
+                            rsid=row['variant_id'],
+                            chromosome=row['chromosome'],
+                            position=row['position'],
+                            user_genotype=user_genotype,
+                            gene=row['mapped_gene'],
+                            trait=row['reported_trait'],
+                            risk_allele=row['risk_allele'],
+                            p_value=p_value,
+                            odds_ratio=row['odds_ratio'],
+                            sample_size=row['sample_size'],
+                            category=row['category'],
+                            allele_frequency=af,
+                            impact_score=impact_score
+                        )
+                        matches.append(match)
+
+                if progress_callback:
+                    progress_callback(100, total_batches or 1, f"Matched {len(matches):,} GWAS entries")
                 
                 logger.info(f"Found {len(matches)} GWAS matches")
                 return matches

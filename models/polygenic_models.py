@@ -67,9 +67,25 @@ class PolygenicVariant:
     other_allele: str
     effect_weight: float
     effect_allele_frequency: Optional[float] = None
+    dosage_0_weight: Optional[float] = None
+    dosage_1_weight: Optional[float] = None
+    dosage_2_weight: Optional[float] = None
     
     def __repr__(self) -> str:
         return f"PolygenicVariant({self.rsid}, weight={self.effect_weight:.4f})"
+
+    @property
+    def locus_key(self) -> str:
+        """Return a chromosome-position key for fallback matching."""
+        return f"{self.chromosome}:{self.position}"
+
+    @property
+    def has_dosage_weights(self) -> bool:
+        """Return True when dosage-specific weights are available."""
+        return all(
+            value is not None
+            for value in (self.dosage_0_weight, self.dosage_1_weight, self.dosage_2_weight)
+        )
 
 
 @dataclass
@@ -237,6 +253,7 @@ class DatabaseVersion:
         source_url: URL where data was obtained
         record_count: Number of records in the database
         checksum: MD5/SHA256 checksum for validation
+        source_type: Origin marker such as 'sample' or 'catalog'
     """
     database_name: str
     version: str
@@ -245,6 +262,7 @@ class DatabaseVersion:
     source_url: str
     record_count: int
     checksum: Optional[str] = None
+    source_type: Optional[str] = None
     
     def __repr__(self) -> str:
         return f"DatabaseVersion({self.database_name}, v{self.version})"

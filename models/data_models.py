@@ -1,11 +1,11 @@
 """
 Data models for the Genetic Analysis Application.
 
-Contains dataclasses for SNP records, GWAS matches, and filter criteria.
+Contains dataclasses for parsed variants, GWAS matches, and filter criteria.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 import re
 
 from config import (
@@ -19,25 +19,33 @@ from config import (
 @dataclass
 class SNPRecord:
     """
-    Represents a SNP read from a 23andMe raw data file.
+    Canonical representation of a parsed genetic variant.
     
     Attributes:
-        rsid: SNP identifier (e.g., "rs6983267")
+        rsid: Variant identifier (e.g., "rs6983267") when available
         chromosome: Chromosome number or letter (1-22, X, Y, MT)
         position: Genomic position
-        genotype: User's genotype at this position (e.g., "GG", "AT")
+        genotype: User genotype at this position (e.g., "GG", "AT")
+        source_format: Format that produced this record.
+        source_metadata: Format-specific metadata preserved for later use.
+        is_valid: Whether the parser considered this record valid.
+        validation_notes: Optional warnings or notes from parsing.
         
     Raises:
         ValueError: If any field fails validation.
     """
-    rsid: str
+    rsid: Optional[str]
     chromosome: str
     position: int
     genotype: str
+    source_format: str = '23andMe raw'
+    source_metadata: Dict[str, Any] = field(default_factory=dict)
+    is_valid: bool = True
+    validation_notes: List[str] = field(default_factory=list)
     
     def __post_init__(self) -> None:
         """Validate all fields after initialization."""
-        if not RSID_PATTERN.match(self.rsid):
+        if self.rsid is not None and not RSID_PATTERN.match(self.rsid):
             raise ValueError(f"Invalid RSID format: {self.rsid}")
         
         if self.chromosome not in VALID_CHROMOSOMES:
@@ -48,9 +56,31 @@ class SNPRecord:
         
         if not GENOTYPE_PATTERN.match(self.genotype):
             raise ValueError(f"Invalid genotype: {self.genotype}")
+
+    @property
+    def variant_key(self) -> str:
+        """Return a stable identifier for matching, even without an rsid."""
+        metadata_key = self.source_metadata.get('variant_key')
+        if metadata_key:
+            return str(metadata_key)
+
+        if self.rsid:
+            return self.rsid
+
+        return f"{self.chromosome}:{self.position}:{self.genotype}"
+
+    @property
+    def lookup_id(self) -> str:
+        """Return the preferred identifier for matching and caching."""
+        return self.variant_key
+
+    @property
+    def has_rsid(self) -> bool:
+        return bool(self.rsid)
     
     def __repr__(self) -> str:
-        return f"SNPRecord({self.rsid}, chr{self.chromosome}:{self.position}, {self.genotype})"
+        identifier = self.rsid or self.variant_key
+        return f"SNPRecord({identifier}, chr{self.chromosome}:{self.position}, {self.genotype})"
 
 
 @dataclass

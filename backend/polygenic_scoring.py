@@ -38,6 +38,8 @@ class PolygenicScorer:
     def __init__(self) -> None:
         """Initialize the scorer."""
         self._genotype_cache: Dict[str, str] = {}
+        # Number of original SNPRecord entries loaded (distinct records)
+        self._genotype_record_count: int = 0
         self._progress_callback: Optional[Callable[[int, int, str], None]] = None
     
     def set_progress_callback(
@@ -64,7 +66,43 @@ class PolygenicScorer:
         Args:
             snp_records: List of SNP records from user's file.
         """
-        self._genotype_cache = {snp.rsid: snp.genotype for snp in snp_records}
+        # Build a genotype lookup cache using multiple keys per SNP so that
+        # different variant identifier styles (rsid, chr:pos, chr:pos:ref>alt)
+        # all resolve to the same genotype. This fixes matching for VCF files
+        # which may expose variant keys different from the simple locus key
+        # used by polygenic definitions.
+        self._genotype_cache = {}
+        # Track number of actual SNP records provided (tests expect this)
+        try:
+            self._genotype_record_count = len(snp_records)
+        except Exception:
+            self._genotype_record_count = 0
+        for snp in snp_records:
+            genotype = snp.genotype
+
+            # 1) Store by rsid when present (e.g. 'rs12345')
+            if getattr(snp, 'rsid', None):
+                try:
+                    if snp.rsid:
+                        self._genotype_cache[snp.rsid] = genotype
+                except Exception:
+                    pass
+
+            # 2) Store by simple locus key 'chrom:position' (used by PolygenicVariant.locus_key)
+            try:
+                locus = f"{snp.chromosome}:{snp.position}"
+                self._genotype_cache[locus] = genotype
+            except Exception:
+                pass
+
+            # 3) Store by any parser-provided variant_key (e.g. 'chr:pos:ref>alt')
+            try:
+                vk = snp.source_metadata.get('variant_key') if snp.source_metadata else None
+                if vk:
+                    self._genotype_cache[str(vk)] = genotype
+            except Exception:
+                pass
+
         logger.info(f"Loaded {len(self._genotype_cache)} genotypes into cache")
     
     def compute_score(
@@ -98,6 +136,8 @@ class PolygenicScorer:
         
         for variant in pgs.variants:
             genotype = self._genotype_cache.get(variant.rsid)
+            if genotype is None:
+                genotype = self._genotype_cache.get(variant.locus_key)
             
             if genotype is None:
                 continue
@@ -110,7 +150,9 @@ class PolygenicScorer:
             )
             
             if effect_count is not None:
-                contribution = effect_count * variant.effect_weight
+                contribution = self._calculate_variant_contribution(variant, effect_count)
+                if contribution is None:
+                    continue
                 raw_score += contribution
                 variants_found += 1
                 
@@ -230,6 +272,27 @@ class PolygenicScorer:
             count += 1
         
         return count
+
+    def _calculate_variant_contribution(
+        self,
+        variant: PolygenicVariant,
+        effect_count: int,
+    ) -> Optional[float]:
+        """Calculate a variant contribution using either linear or dosage weights."""
+        if effect_count not in (0, 1, 2):
+            return None
+
+        if variant.has_dosage_weights:
+            dosage_weights = (
+                variant.dosage_0_weight,
+                variant.dosage_1_weight,
+                variant.dosage_2_weight,
+            )
+            if any(weight is None for weight in dosage_weights):
+                return None
+            return float(dosage_weights[effect_count])
+
+        return effect_count * variant.effect_weight
     
     def _normalize_score(
         self,
@@ -278,13 +341,25 @@ class PolygenicScorer:
         for variant in pgs.variants:
             # Use effect allele frequency if available, otherwise assume 0.5
             p = variant.effect_allele_frequency if variant.effect_allele_frequency else 0.5
-            beta = variant.effect_weight
-            
-            # Expected value: E[score] = 2 * p * β (diploid, two alleles)
-            total_mean += 2 * p * beta
-            
-            # Variance: Var[score] = 2 * p * (1-p) * β² (binomial variance for allele count)
-            total_variance += 2 * p * (1 - p) * beta * beta
+            if variant.has_dosage_weights:
+                w0 = variant.dosage_0_weight or 0.0
+                w1 = variant.dosage_1_weight or 0.0
+                w2 = variant.dosage_2_weight or 0.0
+                prob0 = (1 - p) ** 2
+                prob1 = 2 * p * (1 - p)
+                prob2 = p ** 2
+                expected = prob0 * w0 + prob1 * w1 + prob2 * w2
+                expected_square = prob0 * (w0 ** 2) + prob1 * (w1 ** 2) + prob2 * (w2 ** 2)
+                total_mean += expected
+                total_variance += max(0.0, expected_square - expected ** 2)
+            else:
+                beta = variant.effect_weight
+                
+                # Expected value: E[score] = 2 * p * β (diploid, two alleles)
+                total_mean += 2 * p * beta
+                
+                # Variance: Var[score] = 2 * p * (1-p) * β² (binomial variance for allele count)
+                total_variance += 2 * p * (1 - p) * beta * beta
             
             if variant.effect_allele_frequency:
                 variants_with_freq += 1
@@ -308,11 +383,13 @@ class PolygenicScorer:
     def clear_cache(self) -> None:
         """Clear the genotype cache."""
         self._genotype_cache.clear()
+        self._genotype_record_count = 0
     
     @property
     def genotype_count(self) -> int:
         """Get the number of cached genotypes."""
-        return len(self._genotype_cache)
+        # Return number of original SNPRecord entries loaded (not internal lookup keys)
+        return int(self._genotype_record_count)
 
 
 def get_risk_interpretation(result: PolygenicResult) -> str:
@@ -330,7 +407,7 @@ def get_risk_interpretation(result: PolygenicResult) -> str:
     
     if result.is_low_coverage():
         coverage_warning = (
-            f"\n\n⚠️ Low coverage warning: Only {result.coverage_percent:.1f}% of variants "
+            f"\n\n⚠️ Low coverage warning: Only {result.coverage_percent:.0f}% of variants "
             f"({result.variants_found}/{result.variants_total}) were found in your genotype. "
             "This may reduce the accuracy of this score."
         )
@@ -377,7 +454,7 @@ def format_score_summary(result: PolygenicResult) -> Dict[str, str]:
         'category': result.trait_category.value,
         'percentile': f"{result.percentile:.1f}%",
         'risk': result.risk_category.value,
-        'coverage': f"{result.coverage_percent:.1f}%",
+        'coverage': f"{result.coverage_percent:.0f}%",
         'raw_score': f"{result.raw_score:.4f}",
         'z_score': f"{result.normalized_score:.2f}",
         'variants': f"{result.variants_found}/{result.variants_total}",
