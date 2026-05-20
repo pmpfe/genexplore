@@ -5,3 +5,5 @@ logs/*
 database/backups
 database/downloads/*
 database/pgs.db
+database/update_state.json
+
